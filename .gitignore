@@ -1,0 +1,99 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.cursor/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+.env.*
+*.pem
+
+# Training outputs
+logs/
+checkpoints/
+checkpoint_model_*/
+outputs/
+runs/
+tensorboard/
+
+# Weights & checkpoints
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.onnx
+
+# WandB
+wandb/
+
+# Large media & datasets
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.flv
+*.gif
+*.lmdb/
+*.mdb
+
+# Cache & temp
+*.log
+*.tmp
+.cache/
+tmp/
+temp/
+*.removed_*.txt
+
+# Compiled / profiling
+*.prof
+*.lprof
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
+crop/
+*.jsonl

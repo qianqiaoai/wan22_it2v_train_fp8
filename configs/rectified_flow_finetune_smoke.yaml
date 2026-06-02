@@ -1,0 +1,55 @@
+task: i2v-5B
+generator_type: bidirectional
+generator_name: /mnt/data/nlp/user/qiaoqian/models/Wan2.2-TI2V-5B
+text_encoder_name: /mnt/data/nlp/user/qiaoqian/models/Wan2.2-TI2V-5B
+vae_name: /mnt/data/nlp/user/qiaoqian/models/Wan2.2-TI2V-5B
+model_kwargs:
+  timestep_shift: 5.0
+
+data_path: OpenVidHD_gt5s20fps.jsonl
+video_root: /mnt/data/nlp/user/zhendingcheng/OpenVid-1M/videos/
+# data_path: OpenVidHD_faketest.jsonl
+# video_root: /mnt/data/zhendingcheng/OpenVid-1M/videos/
+video_reader: auto
+num_frames: 17
+height: 256
+width: 256
+target_fps: 20
+max_samples: 8
+num_workers: 1
+
+mixed_precision: true
+fp8: true
+gradient_checkpointing: true # 测试时显存不够改为true 训练时为false
+seed: 0
+
+num_train_timestep: 1000
+
+sharding_strategy: hybrid_full
+generator_fsdp_wrap_strategy: size
+text_encoder_fsdp_wrap_strategy: size
+text_encoder_cpu_offload: false
+
+batch_size: 1
+gradient_accumulation_steps: 1
+lr: 5.0e-6
+beta1: 0.0
+beta2: 0.999
+weight_decay: 0.0
+max_grad_norm: 10.0
+optimizer_type: sgd
+max_steps: 1
+ema_start_step: 1000
+
+logdir: logs/smoke
+log_iters: 1000
+# gc_interval: 100
+save_at_end: false
+disable_wandb: true
+wandb_host: WANDB_HOST
+wandb_key: WANDB_KEY
+wandb_entity: WANDB_ENTITY
+wandb_project: WANDB_PROJECT
+wandb_save_dir: ""
+
+# resume_ckpt:
