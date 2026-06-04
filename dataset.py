@@ -33,14 +33,20 @@ class JsonlVideoDataset(Dataset):
         width: int = 480,
         reader: str = "auto",
         max_samples: Optional[int] = None,
+        load_audio_emb: bool = False,
+        audio_emb_key: str = "vocals_emb_base_all",
+        audio_emb_root: Optional[str] = None,
     ):
         self.jsonl_path = Path(jsonl_path)
         self.video_root = Path(video_root) if video_root else None
+        self.audio_emb_root = Path(audio_emb_root) if audio_emb_root else None
         self.target_fps = target_fps
         self.num_frames = int(num_frames)
         self.height = int(height)
         self.width = int(width)
         self.reader = reader
+        self.load_audio_emb = bool(load_audio_emb)
+        self.audio_emb_key = audio_emb_key
         self.samples = self._load_jsonl(max_samples=max_samples)
 
     def _load_jsonl(self, max_samples: Optional[int]) -> List[Dict[str, Any]]:
@@ -63,13 +69,20 @@ class JsonlVideoDataset(Dataset):
                         f"Expected keys 'video' and 'caption' at {self.jsonl_path}:{line_no}, got {list(row.keys())}"
                     )
 
-                video_path = Path(row["video"])
-                if self.video_root and not video_path.is_absolute():
-                    video_path = self.video_root / video_path
+                video_path = self._resolve_path(row["video"], self.video_root)
                 # if not video_path.exists():
                 #     raise FileNotFoundError(f"Video not found at {self.jsonl_path}:{line_no}: {video_path}")
 
-                samples.append({"video": str(video_path), "caption": str(row["caption"]), "idx": len(samples)})
+                sample = {"video": str(video_path), "caption": str(row["caption"]), "idx": len(samples)}
+                if self.load_audio_emb:
+                    if self.audio_emb_key not in row or not row[self.audio_emb_key]:
+                        raise ValueError(
+                            f"Expected audio embedding key '{self.audio_emb_key}' at "
+                            f"{self.jsonl_path}:{line_no}"
+                        )
+                    sample["audio_emb_path"] = str(self._resolve_path(row[self.audio_emb_key], self.audio_emb_root))
+
+                samples.append(sample)
                 if max_samples is not None and len(samples) >= max_samples:
                     break
 
@@ -86,12 +99,91 @@ class JsonlVideoDataset(Dataset):
         video = self._sample_frames(video, self.num_frames)
         video = self._resize_center_crop(video, self.height, self.width)
         video = video.float().div_(127.5).sub_(1.0)
-        return {
+        output = {
             "frames": video.permute(1, 0, 2, 3).contiguous(),  # [C, T, H, W]
             "prompts": item["caption"],
             "video_path": item["video"],
             "idx": item["idx"],
         }
+        if self.load_audio_emb:
+            output["audio_embeds"] = self._load_audio_embedding(item["audio_emb_path"])
+            output["audio_emb_path"] = item["audio_emb_path"]
+        return output
+
+    @staticmethod
+    def _resolve_path(path_value: str, root: Optional[Path]) -> Path:
+        path = Path(path_value)
+        if root and not path.is_absolute():
+            path = root / path
+        return path
+
+    def _load_audio_embedding(self, audio_emb_path: str) -> torch.Tensor:
+        obj = torch.load(audio_emb_path, map_location="cpu")
+        audio = self._extract_tensor(obj, audio_emb_path)
+        audio = torch.as_tensor(audio).float()
+        audio = self._normalize_audio_embedding(audio, audio_emb_path)
+        return self._sample_audio_frames(audio, self.num_frames).contiguous()
+
+    @staticmethod
+    def _extract_tensor(obj: Any, source: str) -> torch.Tensor:
+        if torch.is_tensor(obj):
+            return obj
+        if isinstance(obj, np.ndarray):
+            return torch.from_numpy(obj)
+        if isinstance(obj, dict):
+            preferred_keys = (
+                "audio_embeds",
+                "audio_embed",
+                "audio_embedding",
+                "vocals_emb_base_all",
+                "hidden_states",
+                "last_hidden_state",
+                "features",
+                "feat",
+                "embedding",
+                "emb",
+            )
+            for key in preferred_keys:
+                if key in obj:
+                    return JsonlVideoDataset._extract_tensor(obj[key], source)
+            for value in obj.values():
+                try:
+                    return JsonlVideoDataset._extract_tensor(value, source)
+                except TypeError:
+                    continue
+        raise TypeError(f"Cannot find a tensor audio embedding in {source}")
+
+    @staticmethod
+    def _normalize_audio_embedding(audio: torch.Tensor, source: str) -> torch.Tensor:
+        if audio.ndim == 5 and audio.shape[0] == 1:
+            audio = audio.squeeze(0)
+
+        if audio.ndim == 2:
+            # [F, C] -> [F, 1, C]
+            audio = audio.unsqueeze(1)
+        elif audio.ndim == 3:
+            # Accept both [F, num_layers, C] and [num_layers, F, C].
+            if audio.shape[0] <= 32 and audio.shape[1] > 32:
+                audio = audio.permute(1, 0, 2)
+        elif audio.ndim == 4:
+            # [F, window, num_layers, C], already windowed.
+            pass
+        else:
+            raise ValueError(
+                f"Unsupported audio embedding shape {tuple(audio.shape)} in {source}; "
+                "expected [F, C], [F, L, C], [L, F, C], or [F, W, L, C]."
+            )
+        return audio
+
+    @staticmethod
+    def _sample_audio_frames(audio: torch.Tensor, num_frames: int) -> torch.Tensor:
+        total = audio.shape[0]
+        if total <= 0:
+            raise ValueError("Audio embedding has no frames")
+        if total >= num_frames:
+            return audio[:num_frames]
+        pad = audio[-1:].repeat(num_frames - total, *([1] * (audio.ndim - 1)))
+        return torch.cat([audio, pad], dim=0)
 
     def _read_video(self, video_path: str, target_fps:int) -> torch.Tensor:
         if self.reader == "decord" or (self.reader == "auto" and _is_decord_available()):

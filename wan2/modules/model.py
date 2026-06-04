@@ -268,6 +268,63 @@ class WanCrossAttention(WanSelfAttention):
         return x
 
 
+class AudioProjModel(nn.Module):
+    def __init__(
+        self,
+        seq_len=5,
+        seq_len_vf=8,
+        blocks=12,
+        channels=768,
+        intermediate_dim=512,
+        output_dim=3072,
+        context_tokens=32,
+        norm_output_audio=True,
+    ):
+        super().__init__()
+        self.seq_len = seq_len
+        self.seq_len_vf = seq_len_vf
+        self.blocks = blocks
+        self.channels = channels
+        self.input_dim = seq_len * blocks * channels
+        self.input_dim_vf = seq_len_vf * blocks * channels
+        self.intermediate_dim = intermediate_dim
+        self.context_tokens = context_tokens
+        self.output_dim = output_dim
+
+        self.proj1 = nn.Linear(self.input_dim, intermediate_dim)
+        self.proj1_vf = nn.Linear(self.input_dim_vf, intermediate_dim)
+        self.proj2 = nn.Linear(intermediate_dim, intermediate_dim)
+        self.proj3 = nn.Linear(intermediate_dim, context_tokens * output_dim)
+        self.norm = nn.LayerNorm(output_dim) if norm_output_audio else nn.Identity()
+
+    def forward(self, audio_embeds, audio_embeds_vf):
+        video_length = audio_embeds.shape[1] + audio_embeds_vf.shape[1]
+        batch_size = audio_embeds.shape[0]
+
+        audio_embeds = audio_embeds.reshape(
+            batch_size * audio_embeds.shape[1],
+            audio_embeds.shape[2] * audio_embeds.shape[3] * audio_embeds.shape[4],
+        )
+        audio_embeds_vf = audio_embeds_vf.reshape(
+            batch_size * audio_embeds_vf.shape[1],
+            audio_embeds_vf.shape[2] * audio_embeds_vf.shape[3] * audio_embeds_vf.shape[4],
+        )
+
+        audio_embeds = torch.relu(self.proj1(audio_embeds))
+        audio_embeds_vf = torch.relu(self.proj1_vf(audio_embeds_vf))
+        audio_embeds = audio_embeds.reshape(batch_size, -1, self.intermediate_dim)
+        audio_embeds_vf = audio_embeds_vf.reshape(batch_size, -1, self.intermediate_dim)
+        audio_embeds = torch.cat([audio_embeds, audio_embeds_vf], dim=1)
+        audio_embeds = audio_embeds.reshape(batch_size * video_length, self.intermediate_dim)
+
+        audio_embeds = torch.relu(self.proj2(audio_embeds))
+        context_tokens = self.proj3(audio_embeds).reshape(
+            batch_size * video_length, self.context_tokens, self.output_dim
+        )
+        context_tokens = self.norm(context_tokens.float()).to(context_tokens.dtype)
+        return context_tokens.reshape(batch_size, video_length, self.context_tokens, self.output_dim)
+
+
 class WanAttentionBlock(nn.Module):
 
     def __init__(self,
@@ -296,6 +353,8 @@ class WanAttentionBlock(nn.Module):
             elementwise_affine=True) if cross_attn_norm else nn.Identity()
         self.cross_attn = WanCrossAttention(dim, num_heads, (-1, -1), qk_norm,
                                             eps)
+        self.audio_norm = None
+        self.audio_cross_attn = None
         self.norm2 = WanLayerNorm(dim, eps)
         if USE_TE:
             self.ffn = nn.Sequential(
@@ -310,6 +369,59 @@ class WanAttentionBlock(nn.Module):
         # modulation
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
+    def enable_audio_conditioning(self, audio_qk_norm=None):
+        if self.audio_cross_attn is not None:
+            return
+        qk_norm = self.qk_norm if audio_qk_norm is None else bool(audio_qk_norm)
+        self.audio_norm = WanLayerNorm(self.dim, self.eps, elementwise_affine=True)
+        self.audio_cross_attn = WanCrossAttention(
+            self.dim, self.num_heads, (-1, -1), qk_norm, self.eps)
+
+    def _audio_cross_attention(self, x, audio_context, grid_sizes):
+        residual = torch.zeros_like(x)
+        for sample_idx, (frames, height, width) in enumerate(grid_sizes.tolist()):
+            seq_len = frames * height * width
+            if seq_len == 0:
+                continue
+
+            audio = audio_context[sample_idx]
+            if audio.shape[0] != frames:
+                audio = self._match_audio_frames(audio, frames)
+            if audio.ndim == 2:
+                audio = audio.unsqueeze(1)
+
+            tokens_per_frame = height * width
+            visual = self.audio_norm(x[sample_idx:sample_idx + 1, :seq_len])
+            visual = visual.reshape(1, frames, tokens_per_frame, self.dim)
+            visual = visual.reshape(frames, tokens_per_frame, self.dim)
+            audio = audio.to(device=x.device, dtype=x.dtype)
+            context_lens = torch.full(
+                (frames,),
+                audio.shape[1],
+                dtype=torch.long,
+                device=x.device,
+            )
+            audio_residual = self.audio_cross_attn(visual, audio, context_lens)
+            residual[sample_idx:sample_idx + 1, :seq_len] = audio_residual.reshape(
+                1, seq_len, self.dim)
+        return residual
+
+    @staticmethod
+    def _match_audio_frames(audio, target_frames):
+        current_frames = audio.shape[0]
+        if current_frames == target_frames:
+            return audio
+        if current_frames > target_frames:
+            indices = torch.linspace(
+                0,
+                current_frames - 1,
+                target_frames,
+                device=audio.device,
+            ).round().long()
+            return audio.index_select(0, indices)
+        pad = audio[-1:].repeat(target_frames - current_frames, *([1] * (audio.ndim - 1)))
+        return torch.cat([audio, pad], dim=0)
+
     def forward(
         self,
         x,
@@ -319,6 +431,7 @@ class WanAttentionBlock(nn.Module):
         freqs,
         context,
         context_lens,
+        audio_context=None,
     ):
         r"""
         Args:
@@ -341,15 +454,19 @@ class WanAttentionBlock(nn.Module):
         x = x + y * e[2].squeeze(2)
 
         # cross-attention & ffn function
-        def cross_attn_ffn(x, context, context_lens, e):
+        def cross_attn_ffn(x, context, context_lens, e, audio_context):
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
+            if audio_context is not None:
+                if self.audio_cross_attn is None:
+                    raise ValueError("audio_context was provided, but audio conditioning is not enabled")
+                x = x + self._audio_cross_attention(x, audio_context, grid_sizes)
             y = te_mlp_padded(self.ffn, 
                 self.norm2(x) * (1 + e[4].squeeze(2)) + e[3].squeeze(2))
             # with torch.amp.autocast('cuda', dtype=torch.float32):
             x = x + y * e[5].squeeze(2)
             return x
 
-        x = cross_attn_ffn(x, context, context_lens, e)
+        x = cross_attn_ffn(x, context, context_lens, e, audio_context)
         return x
 
 

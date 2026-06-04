@@ -16,6 +16,11 @@ class RectifiedFlowFineTuneModel(nn.Module):
         self.dtype = torch.bfloat16 if config.mixed_precision else torch.float32
         self.generator_type = getattr(config, "generator_type", "bidirectional")
         self.num_train_timestep = int(getattr(config, "num_train_timestep", 1000))
+        audio_condition = getattr(config, "audio_condition", None)
+        self.audio_condition_enabled = bool(getattr(audio_condition, "enabled", False)) if audio_condition is not None else False
+        self.audio_dropout_prob = float(
+            getattr(audio_condition, "audio_dropout_prob", getattr(audio_condition, "dropout_prob", 0.0))
+        ) if audio_condition is not None else 0.0
 
         model_name = getattr(config, "generator_name", getattr(config, "model_name", "Wan2.1-T2V-1.3B"))
         text_encoder_name = getattr(config, "text_encoder_name", model_name)
@@ -24,6 +29,7 @@ class RectifiedFlowFineTuneModel(nn.Module):
         self.generator = WanDiffusionWrapper(
             **getattr(config, "model_kwargs", {}),
             model_name=model_name,
+            audio_condition=audio_condition,
             # is_causal=self.generator_type == "causal",
         )
         self._set_generator_trainable(True)
@@ -52,9 +58,25 @@ class RectifiedFlowFineTuneModel(nn.Module):
     def encode_video(self, frames: torch.Tensor) -> torch.Tensor:
         return self.vae.encode_to_latent(frames).to(device=self.device, dtype=self.dtype)
 
-    def rectified_flow_loss(self, clean_latent: torch.Tensor, conditional_dict: dict, task: str = None) -> Tuple[torch.Tensor, dict]:
+    def rectified_flow_loss(
+        self,
+        clean_latent: torch.Tensor,
+        conditional_dict: dict,
+        task: str = None,
+        audio_embeds: torch.Tensor = None,
+    ) -> Tuple[torch.Tensor, dict]:
         batch_size, num_frames = clean_latent.shape[:2]
         noise = torch.randn_like(clean_latent)
+        if self.audio_condition_enabled:
+            if audio_embeds is None:
+                raise ValueError("audio_condition.enabled is true, but batch does not contain audio_embeds")
+            audio_embeds = audio_embeds.to(device=self.device, dtype=self.dtype)
+            if self.training and self.audio_dropout_prob > 0.0:
+                keep_shape = (audio_embeds.shape[0],) + (1,) * (audio_embeds.ndim - 1)
+                keep = torch.rand(keep_shape, device=audio_embeds.device) >= self.audio_dropout_prob
+                audio_embeds = audio_embeds * keep.to(dtype=audio_embeds.dtype)
+        else:
+            audio_embeds = None
 
         index = torch.randint(
             0,
@@ -65,7 +87,6 @@ class RectifiedFlowFineTuneModel(nn.Module):
         ).repeat(1, num_frames)
 
         timestep = self.scheduler.timesteps[index].to(device=self.device, dtype=self.dtype)
-
         noisy_latent = self.scheduler.add_noise(
             clean_latent.flatten(0, 1),
             noise.flatten(0, 1),
@@ -83,6 +104,7 @@ class RectifiedFlowFineTuneModel(nn.Module):
             noisy_image_or_video=noisy_latent,
             conditional_dict=conditional_dict,
             timestep=timestep,
+            audio_embeds=audio_embeds,
         )
 
         # per_frame_loss = F.mse_loss(flow_pred.float(), target.float(), reduction="none").mean(dim=(2, 3, 4))

@@ -223,18 +223,26 @@ class WanDiffusionWrapper(torch.nn.Module):
             timestep_shift=8.0,
             uniform_timestep=False,
             local_attn_size=-1,
-            sink_size=0
+            sink_size=0,
+            audio_condition=None,
     ):
         super().__init__()
         self.model_name = model_name
         self.dual_exp = dual_exp
+        self.audio_condition = audio_condition
+        self.audio_condition_enabled = self._cfg_bool(audio_condition, "enabled", False)
 
         if not self.dual_exp:
             self.model = WanModel.from_pretrained(f"{model_name}/")
+            if self.audio_condition_enabled:
+                self._enable_audio_conditioning(self.model)
             self.model.eval()
         else:
             self.model0 = WanModel.from_pretrained(f"{model_name}/")
             self.model1 = WanModel.from_pretrained(f"{model_name}/")
+            if self.audio_condition_enabled:
+                self._enable_audio_conditioning(self.model0)
+                self._enable_audio_conditioning(self.model1)
             self.model0.eval()
             self.model1.eval()
 
@@ -248,6 +256,29 @@ class WanDiffusionWrapper(torch.nn.Module):
 
         # self.seq_len = 32760  # [1, 21, 16, 60, 104]
         self.post_init()
+
+    @staticmethod
+    def _cfg_get(config, key, default=None):
+        if config is None:
+            return default
+        return getattr(config, key, default)
+
+    @classmethod
+    def _cfg_bool(cls, config, key, default=False):
+        return bool(cls._cfg_get(config, key, default))
+
+    def _enable_audio_conditioning(self, model):
+        cfg = self.audio_condition
+        model.enable_audio_conditioning(
+            audio_window=int(self._cfg_get(cfg, "audio_window", 5)),
+            audio_blocks=int(self._cfg_get(cfg, "audio_blocks", 12)),
+            audio_channels=int(self._cfg_get(cfg, "audio_channels", 768)),
+            audio_intermediate_dim=int(self._cfg_get(cfg, "audio_intermediate_dim", 512)),
+            audio_context_tokens=int(self._cfg_get(cfg, "audio_context_tokens", 32)),
+            audio_vae_scale=int(self._cfg_get(cfg, "audio_vae_scale", 4)),
+            norm_output_audio=self._cfg_bool(cfg, "norm_output_audio", True),
+            audio_qk_norm=self._cfg_get(cfg, "audio_qk_norm", None),
+        )
 
     def enable_gradient_checkpointing(self) -> None:
         if not self.dual_exp:
@@ -310,9 +341,12 @@ class WanDiffusionWrapper(torch.nn.Module):
         timestep: torch.Tensor,
         clip_fea: Optional[torch.Tensor] = None,
         y: Optional[torch.Tensor] = None,
+        audio_embeds: Optional[torch.Tensor] = None,
         exp: str = None,
     ) -> Tuple[Any, Any]:
         prompt_embeds = conditional_dict["prompt_embeds"]
+        if self.audio_condition_enabled and audio_embeds is None:
+            raise ValueError("audio_condition.enabled is true, but audio_embeds was not provided")
         if self.dual_exp and exp=='low_snr':
             model = self.model0
         elif self.dual_exp and exp=='high_snr':
@@ -330,21 +364,20 @@ class WanDiffusionWrapper(torch.nn.Module):
         fp8_autocast = fp8_context.context() if fp8_context is not None else nullcontext()
         # X0 prediction
         with fp8_autocast:
+            model_kwargs = dict(
+                t=input_timestep,
+                context=prompt_embeds,
+                seq_len=getattr(self, "seq_len", None),
+                y=y,
+            )
+            if self.audio_condition_enabled:
+                model_kwargs["audio_context"] = audio_embeds
             flow_pred = model(
                 noisy_image_or_video.permute(0, 2, 1, 3, 4),
-                t=input_timestep, context=prompt_embeds,
-                seq_len=getattr(self, "seq_len", None),
-                # clip_fea=clip_fea,
-                y=y
+                **model_kwargs,
             ).permute(0, 2, 1, 3, 4)
 
-        # pred_x0 = self._convert_flow_pred_to_x0(
-        #     flow_pred=flow_pred.flatten(0, 1),
-        #     xt=noisy_image_or_video.flatten(0, 1),
-        #     timestep=timestep.flatten(0, 1)
-        # ).unflatten(0, flow_pred.shape[:2])
-
-        return flow_pred#, pred_x0
+        return flow_pred
 
     def get_scheduler(self) -> FlowMatchScheduler:
         """

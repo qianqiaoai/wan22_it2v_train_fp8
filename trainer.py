@@ -75,12 +75,25 @@ class RectifiedFlowTrainer:
         # print("----Compiling VAE with torch.compile(mode=%s).", compile_mode)
         # self.model.vae.model = torch.compile(self.model.vae.model, mode=compile_mode)
 
-        self.optimizer = torch.optim.AdamW(
-            [p for p in self.model.generator.parameters() if p.requires_grad],
-            lr=config.lr,
-            betas=(config.beta1, config.beta2),
-            weight_decay=config.weight_decay,
-        )
+        trainable_params = [p for p in self.model.generator.parameters() if p.requires_grad]
+        optimizer_type = str(getattr(config, "optimizer_type", "adamw")).lower()
+        if optimizer_type == "adamw":
+            self.optimizer = torch.optim.AdamW(
+                trainable_params,
+                lr=config.lr,
+                betas=(config.beta1, config.beta2),
+                weight_decay=config.weight_decay,
+            )
+        elif optimizer_type == "sgd":
+            self.optimizer = torch.optim.SGD(
+                trainable_params,
+                lr=config.lr,
+                weight_decay=config.weight_decay,
+                momentum=float(getattr(config, "sgd_momentum", 0.0)),
+                foreach=False,
+            )
+        else:
+            raise ValueError(f"Unsupported optimizer_type: {optimizer_type}")
 
         self.dataloader = self._build_dataloader()
 
@@ -204,6 +217,8 @@ class RectifiedFlowTrainer:
             self._resume_dataloader(self.dataloader)
 
     def _build_dataloader(self):
+        audio_condition = getattr(self.config, "audio_condition", None)
+        load_audio_emb = bool(getattr(audio_condition, "enabled", False)) if audio_condition is not None else False
         dataset = JsonlVideoDataset(
             jsonl_path=self.config.data_path,
             video_root=getattr(self.config, "video_root", None),
@@ -213,6 +228,9 @@ class RectifiedFlowTrainer:
             target_fps=int(getattr(self.config, "target_fps", None)),
             reader=getattr(self.config, "video_reader", "auto"),
             max_samples=getattr(self.config, "max_samples", None),
+            load_audio_emb=load_audio_emb,
+            audio_emb_key=getattr(audio_condition, "audio_emb_key", "vocals_emb_base_all") if audio_condition is not None else "vocals_emb_base_all",
+            audio_emb_root=getattr(audio_condition, "audio_emb_root", None) if audio_condition is not None else None,
         )
         sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=True, drop_last=True)
         dataloader = torch.utils.data.DataLoader(
@@ -261,6 +279,9 @@ class RectifiedFlowTrainer:
             batch = next(self.dataloader)
             frames = batch["frames"].to(device=self.device, dtype=self.dtype, non_blocking=True)
             prompts = list(batch["prompts"])
+            audio_embeds = batch.get("audio_embeds")
+            if audio_embeds is not None:
+                audio_embeds = audio_embeds.to(device=self.device, dtype=self.dtype, non_blocking=True)
             # if self.is_main_process:
             #     start = time.time()
             with torch.no_grad():
@@ -281,8 +302,9 @@ class RectifiedFlowTrainer:
                 else nullcontext()
             )
             with sync_context:
-                loss, log_dict = self.model.rectified_flow_loss(clean_latent, conditional_dict, 
-                                                                getattr(self.config, "task", None))
+                loss, log_dict = self.model.rectified_flow_loss(clean_latent, conditional_dict,
+                                                                getattr(self.config, "task", None),
+                                                                audio_embeds=audio_embeds)
                 (loss / self.grad_accum).backward()
                 # if self.is_main_process:
                 #     torch.cuda.synchronize()
