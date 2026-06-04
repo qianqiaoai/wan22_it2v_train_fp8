@@ -17,11 +17,20 @@ width: 480
 target_fps: 20
 load_caption_emb: true
 caption_emb_key: caption_emb
+default_caption_emb_path: /mnt/data/nlp/user/qiaoqian/newproject/wan2.2_5B_fp8/raw_dataset/text_emb/person_speaking_zh_umt5_xxl_bf16.pt
 text_len: 512
 audio_condition:
   enabled: true
+  audio_emb_mode: online
   audio_emb_key: vocals_emb_base_all
   audio_emb_root:
+  audio_path_key: audio_path
+  audio_path_root:
+  audio_model_name_or_path: /mnt/data/nlp/user/qiaoqian/models/chinese-wav2vec2-base
+  audio_sample_rate: 16000
+  audio_encoder_device: cpu
+  audio_model_local_files_only: true
+  audio_only_last_features: false
   drop_prob: 0.0
   window_size: 5
   vae_scale: 4
@@ -34,14 +43,14 @@ audio_condition:
   mask_clean_first_frame: true
   audio_qk_norm:
 # max_samples:
-num_workers: 8
+num_workers: 1
 
 mixed_precision: true
 fp8: true
 gradient_checkpointing: true # 测试时显存不够改为true 训练时为false
 seed: 0
 
-num_train_timestep: 1000
+num_train_timestep: 99999
 
 sharding_strategy: hybrid_full
 generator_fsdp_wrap_strategy: size
@@ -50,7 +59,7 @@ generator_fsdp_wrap_strategy: size
 
 batch_size: 1
 gradient_accumulation_steps: 8
-lr: 5.0e-6
+lr: 1.0e-5
 beta1: 0.0
 beta2: 0.999
 weight_decay: 0.0

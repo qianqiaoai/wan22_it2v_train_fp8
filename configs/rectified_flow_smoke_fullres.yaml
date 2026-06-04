@@ -16,11 +16,20 @@ target_fps: 20
 max_samples: 4
 load_caption_emb: true
 caption_emb_key: caption_emb
+default_caption_emb_path: /mnt/data/nlp/user/qiaoqian/newproject/wan2.2_5B_fp8/raw_dataset/text_emb/person_speaking_zh_umt5_xxl_bf16.pt
 text_len: 512
 audio_condition:
   enabled: true
+  audio_emb_mode: online
   audio_emb_key: vocals_emb_base_all
   audio_emb_root:
+  audio_path_key: audio_path
+  audio_path_root:
+  audio_model_name_or_path: /mnt/data/nlp/user/qiaoqian/models/chinese-wav2vec2-base
+  audio_sample_rate: 16000
+  audio_encoder_device: cpu
+  audio_model_local_files_only: true
+  audio_only_last_features: false
   drop_prob: 0.0
   window_size: 5
   vae_scale: 4

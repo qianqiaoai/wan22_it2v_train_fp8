@@ -4,6 +4,7 @@ from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
@@ -131,7 +132,7 @@ def patch_te_extra_state(model):
             m._load_from_state_dict = custom_load
 
 
-def te_linear_padded(linear, x, multiple=8):
+def te_linear_padded(linear, x, multiple=16):
     if not USE_TE or not isinstance(linear, te.Linear) or x.size(1) % multiple == 0:
         return linear(x)
 
@@ -141,7 +142,7 @@ def te_linear_padded(linear, x, multiple=8):
     return linear(padded)[:, :seq_len]
 
 
-def te_mlp_padded(mlp, x, multiple=8):
+def te_mlp_padded(mlp, x, multiple=16):
     if not USE_TE or x.size(1) % multiple == 0:
         return mlp(x)
 
@@ -314,7 +315,16 @@ class AudioProjModel(nn.Module):
         audio = torch.relu(self.proj2(audio.reshape(batch_size * frames, channels)))
         context_tokens = self.proj3(audio).reshape(
             batch_size * frames, self.context_tokens, self.output_dim)
-        context_tokens = self.norm(context_tokens.float()).to(context_tokens.dtype)
+        if isinstance(self.norm, nn.LayerNorm):
+            context_tokens = F.layer_norm(
+                context_tokens.float(),
+                self.norm.normalized_shape,
+                self.norm.weight.float() if self.norm.weight is not None else None,
+                self.norm.bias.float() if self.norm.bias is not None else None,
+                self.norm.eps,
+            ).to(context_tokens.dtype)
+        else:
+            context_tokens = self.norm(context_tokens)
         return context_tokens.reshape(batch_size, frames, self.context_tokens, self.output_dim)
 
 

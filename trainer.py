@@ -220,35 +220,50 @@ class RectifiedFlowTrainer:
     def _build_dataloader(self):
         audio_condition = getattr(self.config, "audio_condition", None)
         load_audio_emb = bool(getattr(audio_condition, "enabled", False)) if audio_condition is not None else False
+        target_fps = getattr(self.config, "target_fps", None)
+        target_fps = int(target_fps) if target_fps is not None else None
         dataset = JsonlVideoDataset(
             jsonl_path=self.config.data_path,
             video_root=getattr(self.config, "video_root", None),
             num_frames=int(getattr(self.config, "num_frames", 81)),
             height=int(getattr(self.config, "height", 480)),
             width=int(getattr(self.config, "width", 832)),
-            target_fps=int(getattr(self.config, "target_fps", None)),
+            target_fps=target_fps,
             reader=getattr(self.config, "video_reader", "auto"),
             max_samples=getattr(self.config, "max_samples", None),
             load_caption_emb=bool(getattr(self.config, "load_caption_emb", True)),
             caption_emb_key=getattr(self.config, "caption_emb_key", "caption_emb"),
             caption_emb_root=getattr(self.config, "caption_emb_root", None),
+            default_caption_emb_path=getattr(self.config, "default_caption_emb_path", None),
             text_len=int(getattr(self.config, "text_len", 512)),
             load_audio_emb=load_audio_emb,
+            audio_emb_mode=getattr(audio_condition, "audio_emb_mode", "offline") if audio_condition is not None else "offline",
             audio_emb_key=getattr(audio_condition, "audio_emb_key", "vocals_emb_base_all") if audio_condition is not None else "vocals_emb_base_all",
             audio_emb_root=getattr(audio_condition, "audio_emb_root", None) if audio_condition is not None else None,
+            audio_path_key=getattr(audio_condition, "audio_path_key", "audio_path") if audio_condition is not None else "audio_path",
+            audio_path_root=getattr(audio_condition, "audio_path_root", None) if audio_condition is not None else None,
+            audio_model_name_or_path=getattr(audio_condition, "audio_model_name_or_path", "TencentGameMate/chinese-wav2vec2-base") if audio_condition is not None else "TencentGameMate/chinese-wav2vec2-base",
+            audio_sample_rate=int(getattr(audio_condition, "audio_sample_rate", 16000)) if audio_condition is not None else 16000,
+            audio_encoder_device=getattr(audio_condition, "audio_encoder_device", "cpu") if audio_condition is not None else "cpu",
+            audio_model_local_files_only=bool(getattr(audio_condition, "audio_model_local_files_only", False)) if audio_condition is not None else False,
+            audio_only_last_features=bool(getattr(audio_condition, "audio_only_last_features", False)) if audio_condition is not None else False,
         )
         sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=True, drop_last=True)
-        dataloader = torch.utils.data.DataLoader(
-            dataset,
+        num_workers = int(getattr(self.config, "num_workers", 8))
+        dataloader_kwargs = dict(
             batch_size=self.config.batch_size,
             sampler=sampler,
-            num_workers=int(getattr(self.config, "num_workers", 8)),
-            prefetch_factor=4,         # Each worker keeps 2 batches ready (8 total)
-            persistent_workers=True,   # Keeps worker processes alive across epochs
-            pin_memory=True,            # Faster transfer from CPU RAM to GPU VRAM
+            num_workers=num_workers,
+            pin_memory=True,
             drop_last=True,
-            worker_init_fn=worker_init_fn,
         )
+        if num_workers > 0:
+            dataloader_kwargs.update(
+                prefetch_factor=4,
+                persistent_workers=True,
+                worker_init_fn=worker_init_fn,
+            )
+        dataloader = torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
         self.batches_per_epoch = len(dataloader)
         if self.is_main_process:
             print(f"DATASET SIZE {self.batches_per_epoch}")
