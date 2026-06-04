@@ -1,0 +1,36 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+
+# Local environment and editor/runtime state
+.env
+.env.*
+.venv/
+venv/
+.git-local/
+.codex/
+.agents/
+
+# Training and experiment outputs
+logs/
+outputs/
+checkpoints/
+runs/
+tensorboard/
+swanlab/
+wandb/
+events.out.tfevents.*
+*.log
+
+# Large generated artifacts / model weights
+*.ckpt
+*.pth
+*.pt
+*.safetensors
+*.bin
+*.mp4
+*.avi
+*.mov
+*.jsonl
