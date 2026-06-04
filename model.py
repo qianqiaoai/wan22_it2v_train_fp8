@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, Wan2_1_VAEWrapper, Wan2_2_VAEWrapper
+from utils.wan_wrapper import WanDiffusionWrapper, Wan2_1_VAEWrapper, Wan2_2_VAEWrapper
 from wan2.utils.utils import masks_like
 
 
@@ -23,8 +23,7 @@ class RectifiedFlowFineTuneModel(nn.Module):
         ) if audio_condition is not None else 0.0
 
         model_name = getattr(config, "generator_name", getattr(config, "model_name", "Wan2.1-T2V-1.3B"))
-        text_encoder_name = getattr(config, "text_encoder_name", model_name)
-        vae_name = getattr(config, "vae_name", text_encoder_name)
+        vae_name = getattr(config, "vae_name", model_name)
 
         self.generator = WanDiffusionWrapper(
             **getattr(config, "model_kwargs", {}),
@@ -37,8 +36,8 @@ class RectifiedFlowFineTuneModel(nn.Module):
         if getattr(config, "gradient_checkpointing", False):
             self.generator.enable_gradient_checkpointing()
 
-        self.text_encoder = WanTextEncoder(model_name=text_encoder_name)
-        self.text_encoder.requires_grad_(False)
+        # Text conditions are loaded from precomputed caption_emb files by the dataset.
+        self.text_encoder = None
 
         WanVAEWrapper = Wan2_2_VAEWrapper
         self.vae = WanVAEWrapper(model_name=vae_name)

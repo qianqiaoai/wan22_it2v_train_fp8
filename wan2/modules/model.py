@@ -456,9 +456,7 @@ class WanAttentionBlock(nn.Module):
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e, audio_context):
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
-            if audio_context is not None:
-                if self.audio_cross_attn is None:
-                    raise ValueError("audio_context was provided, but audio conditioning is not enabled")
+            if audio_context is not None and self.audio_cross_attn is not None:
                 x = x + self._audio_cross_attention(x, audio_context, grid_sizes)
             y = te_mlp_padded(self.ffn, 
                 self.norm2(x) * (1 + e[4].squeeze(2)) + e[3].squeeze(2))
@@ -592,6 +590,7 @@ class WanModel(ModelMixin, ConfigMixin):
         self.text_embedding = nn.Sequential(
             nn.Linear(text_dim, dim), nn.GELU(approximate='tanh'),
             nn.Linear(dim, dim))
+        self.audio_embedding = None
 
         self.time_embedding = nn.Sequential(
             nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
@@ -630,6 +629,31 @@ class WanModel(ModelMixin, ConfigMixin):
             return nullcontext(), nullcontext()
         return nullcontext(), fp8_context.context()
 
+    def enable_audio_conditioning(
+        self,
+        audio_window=5,
+        audio_blocks=12,
+        audio_channels=768,
+        audio_intermediate_dim=512,
+        audio_context_tokens=32,
+        audio_vae_scale=4,
+        norm_output_audio=True,
+        audio_qk_norm=None,
+    ):
+        del audio_window, audio_intermediate_dim, audio_context_tokens, audio_vae_scale, norm_output_audio
+
+        if self.audio_embedding is None:
+            self.audio_embedding = nn.Linear(audio_channels, self.dim)
+            nn.init.normal_(self.audio_embedding.weight, std=.02)
+            if self.audio_embedding.bias is not None:
+                nn.init.zeros_(self.audio_embedding.bias)
+
+        num_audio_blocks = max(0, min(int(audio_blocks), len(self.blocks)))
+        if num_audio_blocks == 0:
+            return
+        for block in self.blocks[-num_audio_blocks:]:
+            block.enable_audio_conditioning(audio_qk_norm=audio_qk_norm)
+
     def forward(
         self,
         x,
@@ -637,6 +661,7 @@ class WanModel(ModelMixin, ConfigMixin):
         context,
         seq_len=None,
         y=None,
+        audio_context=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -701,6 +726,11 @@ class WanModel(ModelMixin, ConfigMixin):
                     [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
                 for u in context
             ]))
+        if audio_context is not None:
+            if self.audio_embedding is None:
+                raise ValueError("audio_context was provided, but audio conditioning is not enabled")
+            audio_context = audio_context.to(device=device, dtype=self.audio_embedding.weight.dtype)
+            audio_context = self.audio_embedding(audio_context)
 
         # arguments
         kwargs = dict(
@@ -709,7 +739,8 @@ class WanModel(ModelMixin, ConfigMixin):
             grid_sizes=grid_sizes,
             freqs=self.freqs,
             context=context,
-            context_lens=context_lens)
+            context_lens=context_lens,
+            audio_context=audio_context)
 
         def create_custom_forward(module):
             def custom_forward(*inputs, **kwargs):

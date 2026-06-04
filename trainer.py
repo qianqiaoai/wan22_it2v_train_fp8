@@ -60,14 +60,15 @@ class RectifiedFlowTrainer:
             wrap_strategy=config.generator_fsdp_wrap_strategy,
             min_num_params=int(getattr(config, "generator_fsdp_min_num_params", 5e7)),
         )
-        self.model.text_encoder = fsdp_wrap(
-            self.model.text_encoder,
-            sharding_strategy=config.sharding_strategy,
-            mixed_precision=config.mixed_precision,
-            wrap_strategy=config.text_encoder_fsdp_wrap_strategy,
-            min_num_params=int(getattr(config, "text_encoder_fsdp_min_num_params", 5e7)),
-            cpu_offload=bool(getattr(config, "text_encoder_cpu_offload", False)),
-        )
+        if self.model.text_encoder is not None:
+            self.model.text_encoder = fsdp_wrap(
+                self.model.text_encoder,
+                sharding_strategy=config.sharding_strategy,
+                mixed_precision=config.mixed_precision,
+                wrap_strategy=config.text_encoder_fsdp_wrap_strategy,
+                min_num_params=int(getattr(config, "text_encoder_fsdp_min_num_params", 5e7)),
+                cpu_offload=bool(getattr(config, "text_encoder_cpu_offload", False)),
+            )
         self.model.vae = self.model.vae.to(device=self.device, dtype=self.dtype)
         self.model.vae.model.eval()
         self.model.vae.model.encode = torch.compile(self.model.vae.model.encode)
@@ -228,6 +229,10 @@ class RectifiedFlowTrainer:
             target_fps=int(getattr(self.config, "target_fps", None)),
             reader=getattr(self.config, "video_reader", "auto"),
             max_samples=getattr(self.config, "max_samples", None),
+            load_caption_emb=bool(getattr(self.config, "load_caption_emb", True)),
+            caption_emb_key=getattr(self.config, "caption_emb_key", "caption_emb"),
+            caption_emb_root=getattr(self.config, "caption_emb_root", None),
+            text_len=int(getattr(self.config, "text_len", 512)),
             load_audio_emb=load_audio_emb,
             audio_emb_key=getattr(audio_condition, "audio_emb_key", "vocals_emb_base_all") if audio_condition is not None else "vocals_emb_base_all",
             audio_emb_root=getattr(audio_condition, "audio_emb_root", None) if audio_condition is not None else None,
@@ -269,7 +274,6 @@ class RectifiedFlowTrainer:
 
     def train_one_step(self):
         # self.model.generator.train()
-        # self.model.text_encoder.eval()
         # self.model.vae.eval()
         self.optimizer.zero_grad(set_to_none=True)
 
@@ -278,7 +282,7 @@ class RectifiedFlowTrainer:
         for micro_step in range(self.grad_accum):
             batch = next(self.dataloader)
             frames = batch["frames"].to(device=self.device, dtype=self.dtype, non_blocking=True)
-            prompts = list(batch["prompts"])
+            prompt_embeds = batch["prompt_embeds"].to(device=self.device, dtype=self.dtype, non_blocking=True)
             audio_embeds = batch.get("audio_embeds")
             if audio_embeds is not None:
                 audio_embeds = audio_embeds.to(device=self.device, dtype=self.dtype, non_blocking=True)
@@ -290,11 +294,7 @@ class RectifiedFlowTrainer:
                 #     torch.cuda.synchronize()
                 #     print('----vae cost:', time.time()-start)
                 #     start = time.time()
-                conditional_dict = self.model.text_encoder(text_prompts=prompts)
-                # if self.is_main_process:
-                #     torch.cuda.synchronize()
-                #     print('----t5 cost:', time.time()-start)
-                #     start = time.time()
+                conditional_dict = {"prompt_embeds": prompt_embeds}
             
             sync_context = (
                 self.model.generator.no_sync()

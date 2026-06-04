@@ -17,10 +17,12 @@ def cycle(dataloader):
 class JsonlVideoDataset(Dataset):
     """
     JSONL dataset for rows like:
-        {"video": "XXXX.mp4", "caption": "XXXXX"}
+        {"video": "XXXX.mp4", "caption": "XXXXX", "caption_emb": "XXXX.pt"}
 
     If video_root is set, it is only applied to relative video paths.
     Returns video tensors in [C, T, H, W], normalized to [-1, 1].
+    Caption embeddings are padded/truncated to text_len and returned as
+    prompt_embeds, so training does not need to run the T5 text encoder.
     """
 
     def __init__(
@@ -33,18 +35,28 @@ class JsonlVideoDataset(Dataset):
         width: int = 480,
         reader: str = "auto",
         max_samples: Optional[int] = None,
+        load_caption_emb: bool = True,
+        caption_emb_key: str = "caption_emb",
+        caption_emb_root: Optional[str] = None,
+        text_len: int = 512,
         load_audio_emb: bool = False,
         audio_emb_key: str = "vocals_emb_base_all",
         audio_emb_root: Optional[str] = None,
     ):
         self.jsonl_path = Path(jsonl_path)
         self.video_root = Path(video_root) if video_root else None
+        self.caption_emb_root = Path(caption_emb_root) if caption_emb_root else None
         self.audio_emb_root = Path(audio_emb_root) if audio_emb_root else None
         self.target_fps = target_fps
         self.num_frames = int(num_frames)
         self.height = int(height)
         self.width = int(width)
         self.reader = reader
+        self.load_caption_emb = bool(load_caption_emb)
+        self.caption_emb_key = caption_emb_key
+        self.text_len = int(text_len)
+        if self.text_len <= 0:
+            raise ValueError(f"text_len must be positive, got {text_len}")
         self.load_audio_emb = bool(load_audio_emb)
         self.audio_emb_key = audio_emb_key
         self.samples = self._load_jsonl(max_samples=max_samples)
@@ -64,16 +76,23 @@ class JsonlVideoDataset(Dataset):
                 except json.JSONDecodeError as exc:
                     raise ValueError(f"Invalid JSON at {self.jsonl_path}:{line_no}: {exc}") from exc
 
-                if "video" not in row or "caption" not in row:
+                if "video" not in row:
                     raise ValueError(
-                        f"Expected keys 'video' and 'caption' at {self.jsonl_path}:{line_no}, got {list(row.keys())}"
+                        f"Expected key 'video' at {self.jsonl_path}:{line_no}, got {list(row.keys())}"
                     )
 
                 video_path = self._resolve_path(row["video"], self.video_root)
                 # if not video_path.exists():
                 #     raise FileNotFoundError(f"Video not found at {self.jsonl_path}:{line_no}: {video_path}")
 
-                sample = {"video": str(video_path), "caption": str(row["caption"]), "idx": len(samples)}
+                sample = {"video": str(video_path), "caption": str(row.get("caption", "")), "idx": len(samples)}
+                if self.load_caption_emb:
+                    if self.caption_emb_key not in row or not row[self.caption_emb_key]:
+                        raise ValueError(
+                            f"Expected caption embedding key '{self.caption_emb_key}' at "
+                            f"{self.jsonl_path}:{line_no}"
+                        )
+                    sample["caption_emb_path"] = str(self._resolve_path(row[self.caption_emb_key], self.caption_emb_root))
                 if self.load_audio_emb:
                     if self.audio_emb_key not in row or not row[self.audio_emb_key]:
                         raise ValueError(
@@ -96,7 +115,7 @@ class JsonlVideoDataset(Dataset):
     def __getitem__(self, idx):
         item = self.samples[idx]
         video = self._read_video(item["video"], self.target_fps)
-        video = self._sample_frames(video, self.num_frames)
+        video = self._sample_frames(video, self.num_frames, item["video"])
         video = self._resize_center_crop(video, self.height, self.width)
         video = video.float().div_(127.5).sub_(1.0)
         output = {
@@ -108,6 +127,9 @@ class JsonlVideoDataset(Dataset):
         if self.load_audio_emb:
             output["audio_embeds"] = self._load_audio_embedding(item["audio_emb_path"])
             output["audio_emb_path"] = item["audio_emb_path"]
+        if self.load_caption_emb:
+            output["prompt_embeds"] = self._load_caption_embedding(item["caption_emb_path"])
+            output["caption_emb_path"] = item["caption_emb_path"]
         return output
 
     @staticmethod
@@ -124,34 +146,75 @@ class JsonlVideoDataset(Dataset):
         audio = self._normalize_audio_embedding(audio, audio_emb_path)
         return self._sample_audio_frames(audio, self.num_frames).contiguous()
 
+    def _load_caption_embedding(self, caption_emb_path: str) -> torch.Tensor:
+        obj = torch.load(caption_emb_path, map_location="cpu")
+        caption = self._extract_tensor(
+            obj,
+            caption_emb_path,
+            preferred_keys=(
+                "caption_emb",
+                "caption_embed",
+                "caption_embedding",
+                "prompt_embeds",
+                "prompt_embed",
+                "text_embeds",
+                "text_embed",
+                "text_embedding",
+                "hidden_states",
+                "last_hidden_state",
+                "context",
+                "embedding",
+                "emb",
+            ),
+        )
+        caption = torch.as_tensor(caption)
+        if not torch.is_floating_point(caption):
+            caption = caption.float()
+        if caption.ndim == 3 and caption.shape[0] == 1:
+            caption = caption.squeeze(0)
+        if caption.ndim != 2:
+            raise ValueError(
+                f"Unsupported caption embedding shape {tuple(caption.shape)} in {caption_emb_path}; "
+                "expected [L, C] or [1, L, C]."
+            )
+        return self._pad_or_truncate_caption_embedding(caption, self.text_len).contiguous()
+
     @staticmethod
-    def _extract_tensor(obj: Any, source: str) -> torch.Tensor:
+    def _extract_tensor(obj: Any, source: str, preferred_keys: Optional[tuple] = None) -> torch.Tensor:
         if torch.is_tensor(obj):
             return obj
         if isinstance(obj, np.ndarray):
             return torch.from_numpy(obj)
         if isinstance(obj, dict):
-            preferred_keys = (
-                "audio_embeds",
-                "audio_embed",
-                "audio_embedding",
-                "vocals_emb_base_all",
-                "hidden_states",
-                "last_hidden_state",
-                "features",
-                "feat",
-                "embedding",
-                "emb",
-            )
+            if preferred_keys is None:
+                preferred_keys = (
+                    "audio_embeds",
+                    "audio_embed",
+                    "audio_embedding",
+                    "vocals_emb_base_all",
+                    "hidden_states",
+                    "last_hidden_state",
+                    "features",
+                    "feat",
+                    "embedding",
+                    "emb",
+                )
             for key in preferred_keys:
                 if key in obj:
-                    return JsonlVideoDataset._extract_tensor(obj[key], source)
+                    return JsonlVideoDataset._extract_tensor(obj[key], source, preferred_keys=preferred_keys)
             for value in obj.values():
                 try:
-                    return JsonlVideoDataset._extract_tensor(value, source)
+                    return JsonlVideoDataset._extract_tensor(value, source, preferred_keys=preferred_keys)
                 except TypeError:
                     continue
-        raise TypeError(f"Cannot find a tensor audio embedding in {source}")
+        raise TypeError(f"Cannot find a tensor embedding in {source}")
+
+    @staticmethod
+    def _pad_or_truncate_caption_embedding(caption: torch.Tensor, text_len: int) -> torch.Tensor:
+        if caption.shape[0] >= text_len:
+            return caption[:text_len]
+        pad = caption.new_zeros((text_len - caption.shape[0], caption.shape[1]))
+        return torch.cat([caption, pad], dim=0)
 
     @staticmethod
     def _normalize_audio_embedding(audio: torch.Tensor, source: str) -> torch.Tensor:
@@ -230,7 +293,7 @@ class JsonlVideoDataset(Dataset):
     #     return video.contiguous()
 
     @staticmethod
-    def _sample_frames(video: torch.Tensor, num_frames: int) -> torch.Tensor:
+    def _sample_frames(video: torch.Tensor, num_frames: int, video_path: str) -> torch.Tensor:
         total = video.shape[0]
         # if total == num_frames:
         #     return video
@@ -242,7 +305,7 @@ class JsonlVideoDataset(Dataset):
         if total >= num_frames:
             return video[:num_frames]
         else:
-            raise ValueError(f"Video has not enough frames: {video_path}")
+            raise ValueError(f"Video has not enough frames ({total} < {num_frames}): {video_path}")
 
     @staticmethod
     def _resize_center_crop(video: torch.Tensor, height: int, width: int) -> torch.Tensor:

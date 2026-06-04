@@ -7,16 +7,17 @@ from torch import nn
 
 from utils.scheduler import FlowMatchScheduler
 from utils.scheduler import SchedulerInterface, FlowMatchScheduler
-from wan2.modules.tokenizers import HuggingfaceTokenizer
 from wan2.modules.model import WanModel
 from wan2.modules.vae2_1 import _video_vae as _video_vae2_1
 from wan2.modules.vae2_2 import _video_vae as _video_vae2_2
-from wan2.modules.t5 import umt5_xxl
 
 
 class WanTextEncoder(torch.nn.Module):
     def __init__(self, model_name="Wan2.1-T2V-14B") -> None:
         super().__init__()
+        from wan2.modules.t5 import umt5_xxl
+        from wan2.modules.tokenizers import HuggingfaceTokenizer
+
         self.model_name = model_name
 
         self.text_encoder = umt5_xxl(

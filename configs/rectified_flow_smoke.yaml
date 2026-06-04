@@ -1,7 +1,7 @@
 task: i2v-5B
 generator_type: bidirectional
 generator_name: /mnt/data/nlp/user/qiaoqian/models/Wan2.2-TI2V-5B
-text_encoder_name: /mnt/data/nlp/user/qiaoqian/models/Wan2.2-TI2V-5B
+# text_encoder_name is unused; prompt_embeds are loaded from caption_emb files.
 vae_name: /mnt/data/nlp/user/qiaoqian/models/Wan2.2-TI2V-5B
 model_kwargs:
   timestep_shift: 5.0
@@ -14,6 +14,17 @@ height: 256
 width: 256
 target_fps: 20
 max_samples: 2
+load_caption_emb: true
+caption_emb_key: caption_emb
+text_len: 512
+audio_condition:
+  enabled: true
+  audio_emb_key: vocals_emb_base_all
+  audio_emb_root:
+  audio_channels: 768
+  audio_blocks: 12
+  audio_qk_norm:
+  audio_dropout_prob: 0.0
 num_workers: 1
 
 mixed_precision: true
@@ -25,8 +36,8 @@ num_train_timestep: 1000
 
 sharding_strategy: full
 generator_fsdp_wrap_strategy: size
-text_encoder_fsdp_wrap_strategy: size
-text_encoder_cpu_offload: false
+# text_encoder_fsdp_wrap_strategy is unused when load_caption_emb is true.
+# text_encoder_cpu_offload is unused when load_caption_emb is true.
 
 batch_size: 1
 gradient_accumulation_steps: 1
