@@ -268,16 +268,25 @@ class WanDiffusionWrapper(torch.nn.Module):
     def _cfg_bool(cls, config, key, default=False):
         return bool(cls._cfg_get(config, key, default))
 
+    @classmethod
+    def _cfg_first(cls, config, keys, default=None):
+        for key in keys:
+            value = cls._cfg_get(config, key, None)
+            if value is not None:
+                return value
+        return default
+
     def _enable_audio_conditioning(self, model):
         cfg = self.audio_condition
         model.enable_audio_conditioning(
-            audio_window=int(self._cfg_get(cfg, "audio_window", 5)),
-            audio_blocks=int(self._cfg_get(cfg, "audio_blocks", 12)),
-            audio_channels=int(self._cfg_get(cfg, "audio_channels", 768)),
-            audio_intermediate_dim=int(self._cfg_get(cfg, "audio_intermediate_dim", 512)),
-            audio_context_tokens=int(self._cfg_get(cfg, "audio_context_tokens", 32)),
-            audio_vae_scale=int(self._cfg_get(cfg, "audio_vae_scale", 4)),
+            audio_window=int(self._cfg_first(cfg, ("window_size", "audio_window"), 5)),
+            vae_scale=int(self._cfg_first(cfg, ("vae_scale", "audio_vae_scale"), 4)),
+            audio_layers=int(self._cfg_first(cfg, ("layers", "audio_layers"), 12)),
+            audio_dim=int(self._cfg_first(cfg, ("input_dim", "audio_dim", "audio_channels"), 768)),
+            intermediate_dim=int(self._cfg_first(cfg, ("intermediate_dim", "audio_intermediate_dim"), 512)),
+            context_tokens=int(self._cfg_first(cfg, ("context_tokens", "audio_context_tokens"), 32)),
             norm_output_audio=self._cfg_bool(cfg, "norm_output_audio", True),
+            zero_init_audio_output=self._cfg_bool(cfg, "zero_init_audio_output", True),
             audio_qk_norm=self._cfg_get(cfg, "audio_qk_norm", None),
         )
 
@@ -343,6 +352,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         clip_fea: Optional[torch.Tensor] = None,
         y: Optional[torch.Tensor] = None,
         audio_embeds: Optional[torch.Tensor] = None,
+        mask_clean_first_audio: bool = False,
         exp: str = None,
     ) -> Tuple[Any, Any]:
         prompt_embeds = conditional_dict["prompt_embeds"]
@@ -372,7 +382,8 @@ class WanDiffusionWrapper(torch.nn.Module):
                 y=y,
             )
             if self.audio_condition_enabled:
-                model_kwargs["audio_context"] = audio_embeds
+                model_kwargs["audio_emb"] = audio_embeds
+                model_kwargs["mask_clean_first_audio"] = mask_clean_first_audio
             flow_pred = model(
                 noisy_image_or_video.permute(0, 2, 1, 3, 4),
                 **model_kwargs,

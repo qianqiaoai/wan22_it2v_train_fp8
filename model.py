@@ -19,8 +19,11 @@ class RectifiedFlowFineTuneModel(nn.Module):
         audio_condition = getattr(config, "audio_condition", None)
         self.audio_condition_enabled = bool(getattr(audio_condition, "enabled", False)) if audio_condition is not None else False
         self.audio_dropout_prob = float(
-            getattr(audio_condition, "audio_dropout_prob", getattr(audio_condition, "dropout_prob", 0.0))
+            getattr(audio_condition, "drop_prob", getattr(audio_condition, "audio_dropout_prob", getattr(audio_condition, "dropout_prob", 0.0)))
         ) if audio_condition is not None else 0.0
+        self.mask_clean_first_audio = bool(
+            getattr(audio_condition, "mask_clean_first_frame", True)
+        ) if audio_condition is not None else True
 
         model_name = getattr(config, "generator_name", getattr(config, "model_name", "Wan2.1-T2V-1.3B"))
         vae_name = getattr(config, "vae_name", model_name)
@@ -104,6 +107,7 @@ class RectifiedFlowFineTuneModel(nn.Module):
             conditional_dict=conditional_dict,
             timestep=timestep,
             audio_embeds=audio_embeds,
+            mask_clean_first_audio=self.audio_condition_enabled and task == 'i2v-5B' and self.mask_clean_first_audio,
         )
 
         # per_frame_loss = F.mse_loss(flow_pred.float(), target.float(), reduction="none").mean(dim=(2, 3, 4))

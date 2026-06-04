@@ -271,58 +271,51 @@ class WanCrossAttention(WanSelfAttention):
 class AudioProjModel(nn.Module):
     def __init__(
         self,
-        seq_len=5,
-        seq_len_vf=8,
-        blocks=12,
-        channels=768,
+        audio_window=5,
+        vae_scale=4,
+        audio_layers=12,
+        audio_dim=768,
         intermediate_dim=512,
         output_dim=3072,
         context_tokens=32,
         norm_output_audio=True,
     ):
         super().__init__()
-        self.seq_len = seq_len
-        self.seq_len_vf = seq_len_vf
-        self.blocks = blocks
-        self.channels = channels
-        self.input_dim = seq_len * blocks * channels
-        self.input_dim_vf = seq_len_vf * blocks * channels
-        self.intermediate_dim = intermediate_dim
-        self.context_tokens = context_tokens
-        self.output_dim = output_dim
+        self.audio_window = int(audio_window)
+        self.vae_scale = int(vae_scale)
+        self.audio_layers = int(audio_layers)
+        self.audio_dim = int(audio_dim)
+        self.latter_window = self.vae_scale + self.audio_window - 1
+        self.intermediate_dim = int(intermediate_dim)
+        self.output_dim = int(output_dim)
+        self.context_tokens = int(context_tokens)
 
-        self.proj1 = nn.Linear(self.input_dim, intermediate_dim)
-        self.proj1_vf = nn.Linear(self.input_dim_vf, intermediate_dim)
+        self.proj1 = nn.Linear(self.audio_window * self.audio_layers * self.audio_dim, self.intermediate_dim)
+        self.proj1_latter = nn.Linear(self.latter_window * self.audio_layers * self.audio_dim, self.intermediate_dim)
         self.proj2 = nn.Linear(intermediate_dim, intermediate_dim)
         self.proj3 = nn.Linear(intermediate_dim, context_tokens * output_dim)
         self.norm = nn.LayerNorm(output_dim) if norm_output_audio else nn.Identity()
 
-    def forward(self, audio_embeds, audio_embeds_vf):
-        video_length = audio_embeds.shape[1] + audio_embeds_vf.shape[1]
-        batch_size = audio_embeds.shape[0]
+    def forward(self, first_frame_audio, latter_frame_audio):
+        batch_size = first_frame_audio.shape[0]
+        first = first_frame_audio.reshape(batch_size, first_frame_audio.shape[1], -1)
+        first = torch.relu(self.proj1(first.reshape(-1, first.shape[-1]))).view(
+            batch_size, first_frame_audio.shape[1], -1)
 
-        audio_embeds = audio_embeds.reshape(
-            batch_size * audio_embeds.shape[1],
-            audio_embeds.shape[2] * audio_embeds.shape[3] * audio_embeds.shape[4],
-        )
-        audio_embeds_vf = audio_embeds_vf.reshape(
-            batch_size * audio_embeds_vf.shape[1],
-            audio_embeds_vf.shape[2] * audio_embeds_vf.shape[3] * audio_embeds_vf.shape[4],
-        )
+        if latter_frame_audio.shape[1] > 0:
+            latter = latter_frame_audio.reshape(batch_size, latter_frame_audio.shape[1], -1)
+            latter = torch.relu(self.proj1_latter(latter.reshape(-1, latter.shape[-1]))).view(
+                batch_size, latter_frame_audio.shape[1], -1)
+            audio = torch.cat([first, latter], dim=1)
+        else:
+            audio = first
 
-        audio_embeds = torch.relu(self.proj1(audio_embeds))
-        audio_embeds_vf = torch.relu(self.proj1_vf(audio_embeds_vf))
-        audio_embeds = audio_embeds.reshape(batch_size, -1, self.intermediate_dim)
-        audio_embeds_vf = audio_embeds_vf.reshape(batch_size, -1, self.intermediate_dim)
-        audio_embeds = torch.cat([audio_embeds, audio_embeds_vf], dim=1)
-        audio_embeds = audio_embeds.reshape(batch_size * video_length, self.intermediate_dim)
-
-        audio_embeds = torch.relu(self.proj2(audio_embeds))
-        context_tokens = self.proj3(audio_embeds).reshape(
-            batch_size * video_length, self.context_tokens, self.output_dim
-        )
+        batch_size, frames, channels = audio.shape
+        audio = torch.relu(self.proj2(audio.reshape(batch_size * frames, channels)))
+        context_tokens = self.proj3(audio).reshape(
+            batch_size * frames, self.context_tokens, self.output_dim)
         context_tokens = self.norm(context_tokens.float()).to(context_tokens.dtype)
-        return context_tokens.reshape(batch_size, video_length, self.context_tokens, self.output_dim)
+        return context_tokens.reshape(batch_size, frames, self.context_tokens, self.output_dim)
 
 
 class WanAttentionBlock(nn.Module):
@@ -369,42 +362,45 @@ class WanAttentionBlock(nn.Module):
         # modulation
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
-    def enable_audio_conditioning(self, audio_qk_norm=None):
+    def enable_audio_conditioning(self, audio_qk_norm=None, zero_init_output=True):
         if self.audio_cross_attn is not None:
             return
         qk_norm = self.qk_norm if audio_qk_norm is None else bool(audio_qk_norm)
         self.audio_norm = WanLayerNorm(self.dim, self.eps, elementwise_affine=True)
         self.audio_cross_attn = WanCrossAttention(
             self.dim, self.num_heads, (-1, -1), qk_norm, self.eps)
+        if zero_init_output:
+            nn.init.zeros_(self.audio_cross_attn.o.weight)
+            if self.audio_cross_attn.o.bias is not None:
+                nn.init.zeros_(self.audio_cross_attn.o.bias)
 
     def _audio_cross_attention(self, x, audio_context, grid_sizes):
-        residual = torch.zeros_like(x)
+        if audio_context is None or self.audio_cross_attn is None or self.audio_norm is None:
+            return x.new_zeros(x.shape)
+
+        residuals = []
         for sample_idx, (frames, height, width) in enumerate(grid_sizes.tolist()):
+            frames, height, width = int(frames), int(height), int(width)
             seq_len = frames * height * width
             if seq_len == 0:
+                residuals.append(x.new_zeros(1, x.shape[1], self.dim))
                 continue
 
             audio = audio_context[sample_idx]
-            if audio.shape[0] != frames:
-                audio = self._match_audio_frames(audio, frames)
-            if audio.ndim == 2:
-                audio = audio.unsqueeze(1)
+            if audio.shape[0] < frames:
+                pad = audio[-1:].expand(frames - audio.shape[0], -1, -1)
+                audio = torch.cat([audio, pad], dim=0)
+            audio = audio[:frames].reshape(frames, -1, self.dim).to(device=x.device, dtype=x.dtype)
 
-            tokens_per_frame = height * width
             visual = self.audio_norm(x[sample_idx:sample_idx + 1, :seq_len])
-            visual = visual.reshape(1, frames, tokens_per_frame, self.dim)
-            visual = visual.reshape(frames, tokens_per_frame, self.dim)
-            audio = audio.to(device=x.device, dtype=x.dtype)
-            context_lens = torch.full(
-                (frames,),
-                audio.shape[1],
-                dtype=torch.long,
-                device=x.device,
-            )
-            audio_residual = self.audio_cross_attn(visual, audio, context_lens)
-            residual[sample_idx:sample_idx + 1, :seq_len] = audio_residual.reshape(
-                1, seq_len, self.dim)
-        return residual
+            visual = visual.reshape(1, frames, height * width, self.dim).reshape(frames, height * width, self.dim)
+            audio_residual = self.audio_cross_attn(visual, audio, None).reshape(1, seq_len, self.dim)
+            if seq_len < x.shape[1]:
+                audio_residual = torch.cat(
+                    [audio_residual, audio_residual.new_zeros(1, x.shape[1] - seq_len, self.dim)],
+                    dim=1)
+            residuals.append(audio_residual)
+        return torch.cat(residuals, dim=0)
 
     @staticmethod
     def _match_audio_frames(audio, target_frames):
@@ -590,7 +586,12 @@ class WanModel(ModelMixin, ConfigMixin):
         self.text_embedding = nn.Sequential(
             nn.Linear(text_dim, dim), nn.GELU(approximate='tanh'),
             nn.Linear(dim, dim))
-        self.audio_embedding = None
+        self.audio_proj = None
+        self.audio_window = 5
+        self.audio_vae_scale = 4
+        self.audio_layers = 12
+        self.audio_dim = 768
+        self.audio_context_tokens = 32
 
         self.time_embedding = nn.Sequential(
             nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
@@ -632,27 +633,41 @@ class WanModel(ModelMixin, ConfigMixin):
     def enable_audio_conditioning(
         self,
         audio_window=5,
-        audio_blocks=12,
-        audio_channels=768,
-        audio_intermediate_dim=512,
-        audio_context_tokens=32,
-        audio_vae_scale=4,
+        vae_scale=4,
+        audio_layers=12,
+        audio_dim=768,
+        intermediate_dim=512,
+        context_tokens=32,
         norm_output_audio=True,
+        zero_init_audio_output=True,
         audio_qk_norm=None,
     ):
-        del audio_window, audio_intermediate_dim, audio_context_tokens, audio_vae_scale, norm_output_audio
+        self.audio_window = int(audio_window)
+        self.audio_vae_scale = int(vae_scale)
+        self.audio_layers = int(audio_layers)
+        self.audio_dim = int(audio_dim)
+        self.audio_context_tokens = int(context_tokens)
+        self.audio_proj = AudioProjModel(
+            audio_window=self.audio_window,
+            vae_scale=self.audio_vae_scale,
+            audio_layers=self.audio_layers,
+            audio_dim=self.audio_dim,
+            intermediate_dim=intermediate_dim,
+            output_dim=self.dim,
+            context_tokens=self.audio_context_tokens,
+            norm_output_audio=norm_output_audio,
+        )
+        for block in self.blocks:
+            block.enable_audio_conditioning(
+                audio_qk_norm=audio_qk_norm,
+                zero_init_output=zero_init_audio_output)
 
-        if self.audio_embedding is None:
-            self.audio_embedding = nn.Linear(audio_channels, self.dim)
-            nn.init.normal_(self.audio_embedding.weight, std=.02)
-            if self.audio_embedding.bias is not None:
-                nn.init.zeros_(self.audio_embedding.bias)
-
-        num_audio_blocks = max(0, min(int(audio_blocks), len(self.blocks)))
-        if num_audio_blocks == 0:
-            return
-        for block in self.blocks[-num_audio_blocks:]:
-            block.enable_audio_conditioning(audio_qk_norm=audio_qk_norm)
+        device = self.patch_embedding.weight.device
+        dtype = self.patch_embedding.weight.dtype
+        self.audio_proj.to(device=device, dtype=dtype)
+        for block in self.blocks:
+            block.audio_norm.to(device=device, dtype=dtype)
+            block.audio_cross_attn.to(device=device, dtype=dtype)
 
     def forward(
         self,
@@ -661,7 +676,8 @@ class WanModel(ModelMixin, ConfigMixin):
         context,
         seq_len=None,
         y=None,
-        audio_context=None,
+        audio_emb=None,
+        mask_clean_first_audio=False,
     ):
         r"""
         Forward pass through the diffusion model
@@ -726,11 +742,11 @@ class WanModel(ModelMixin, ConfigMixin):
                     [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
                 for u in context
             ]))
-        if audio_context is not None:
-            if self.audio_embedding is None:
-                raise ValueError("audio_context was provided, but audio conditioning is not enabled")
-            audio_context = audio_context.to(device=device, dtype=self.audio_embedding.weight.dtype)
-            audio_context = self.audio_embedding(audio_context)
+        audio_context = self._prepare_audio_context(
+            audio_emb,
+            grid_sizes,
+            mask_clean_first_audio=mask_clean_first_audio,
+        )
 
         # arguments
         kwargs = dict(
@@ -743,15 +759,22 @@ class WanModel(ModelMixin, ConfigMixin):
             audio_context=audio_context)
 
         def create_custom_forward(module):
-            def custom_forward(*inputs, **kwargs):
-                return module(*inputs, **kwargs)
+            def custom_forward(*inputs):
+                return module(*inputs)
             return custom_forward
 
         for block in self.blocks:
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 x = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
-                    x, **kwargs,
+                    x,
+                    e0,
+                    seq_lens,
+                    grid_sizes,
+                    self.freqs,
+                    context,
+                    context_lens,
+                    audio_context,
                     context_fn=self._checkpoint_context_fn,
                     use_reentrant=False,
                 )
@@ -764,6 +787,99 @@ class WanModel(ModelMixin, ConfigMixin):
         # unpatchify
         x = self.unpatchify(x, grid_sizes)
         return torch.stack(x)
+
+    def _prepare_audio_context(self, audio_emb, grid_sizes, mask_clean_first_audio=False):
+        if audio_emb is None:
+            return None
+        if self.audio_proj is None:
+            raise ValueError("audio_emb was provided but audio conditioning is not enabled")
+
+        if torch.is_tensor(audio_emb):
+            audio_items = [audio_emb] if audio_emb.dim() == 3 else [item for item in audio_emb]
+        else:
+            audio_items = list(audio_emb)
+        if len(audio_items) != grid_sizes.shape[0]:
+            raise ValueError(
+                f"audio_emb batch size {len(audio_items)} does not match video batch size {grid_sizes.shape[0]}")
+
+        contexts = []
+        for raw_audio, grid_size in zip(audio_items, grid_sizes.tolist()):
+            latent_frames = int(grid_size[0])
+            target_video_frames = 1 + max(0, latent_frames - 1) * self.audio_vae_scale
+            raw_audio = self._normalize_audio_tensor(raw_audio, target_video_frames)
+            audio_windows = self._audio_sliding_windows(raw_audio)
+            contexts.append(self._project_audio_windows(audio_windows, latent_frames))
+
+        max_frames = max(context.shape[0] for context in contexts)
+        padded = []
+        for context in contexts:
+            if context.shape[0] < max_frames:
+                pad = context.new_zeros(max_frames - context.shape[0], context.shape[1], context.shape[2])
+                context = torch.cat([context, pad], dim=0)
+            padded.append(context)
+        audio_context = torch.stack(padded, dim=0)
+        if mask_clean_first_audio and audio_context.shape[1] > 0:
+            audio_context = audio_context.clone()
+            audio_context[:, 0] = 0
+        return audio_context
+
+    def _normalize_audio_tensor(self, audio, target_video_frames):
+        audio = audio.to(device=self.patch_embedding.weight.device, dtype=self.patch_embedding.weight.dtype)
+        if audio.dim() == 4 and audio.shape[0] == 1:
+            audio = audio.squeeze(0)
+        if audio.dim() != 3:
+            raise ValueError(
+                f"audio_emb must have shape [T, {self.audio_layers}, {self.audio_dim}], got {tuple(audio.shape)}")
+        if audio.shape[1] != self.audio_layers and audio.shape[0] == self.audio_layers:
+            audio = audio.transpose(0, 1).contiguous()
+        if audio.shape[1] != self.audio_layers or audio.shape[2] != self.audio_dim:
+            raise ValueError(
+                f"audio_emb must have shape [T, {self.audio_layers}, {self.audio_dim}], got {tuple(audio.shape)}")
+        if audio.shape[0] == 0:
+            raise ValueError("audio_emb must not be empty")
+
+        if audio.shape[0] < target_video_frames:
+            pad = audio[-1:].expand(target_video_frames - audio.shape[0], -1, -1)
+            audio = torch.cat([audio, pad], dim=0)
+        return audio[:target_video_frames].contiguous()
+
+    def _audio_sliding_windows(self, audio):
+        radius = self.audio_window // 2
+        offsets = torch.arange(self.audio_window, device=audio.device) - radius
+        indices = torch.arange(audio.shape[0], device=audio.device).unsqueeze(1) + offsets.unsqueeze(0)
+        indices = indices.clamp_(0, audio.shape[0] - 1).long()
+        return audio[indices]
+
+    def _project_audio_windows(self, audio_windows, latent_frames):
+        first_frame_audio = audio_windows[:1].unsqueeze(0)
+        if latent_frames > 1:
+            required_latter = (latent_frames - 1) * self.audio_vae_scale
+            latter = audio_windows[1:1 + required_latter].reshape(
+                1,
+                latent_frames - 1,
+                self.audio_vae_scale,
+                self.audio_window,
+                self.audio_layers,
+                self.audio_dim,
+            )
+            mid_idx = self.audio_window // 2
+            first_of_group = latter[:, :, :1, :mid_idx + 1]
+            middle_of_group = latter[:, :, 1:-1, mid_idx:mid_idx + 1]
+            last_of_group = latter[:, :, -1:, mid_idx:]
+            latter_frame_audio = torch.cat([
+                first_of_group.reshape(1, latent_frames - 1, -1, self.audio_layers, self.audio_dim),
+                middle_of_group.reshape(1, latent_frames - 1, -1, self.audio_layers, self.audio_dim),
+                last_of_group.reshape(1, latent_frames - 1, -1, self.audio_layers, self.audio_dim),
+            ], dim=2)
+        else:
+            latter_frame_audio = audio_windows.new_empty(
+                1,
+                0,
+                self.audio_vae_scale + self.audio_window - 1,
+                self.audio_layers,
+                self.audio_dim,
+            )
+        return self.audio_proj(first_frame_audio, latter_frame_audio).squeeze(0)
 
     def unpatchify(self, x, grid_sizes):
         r"""

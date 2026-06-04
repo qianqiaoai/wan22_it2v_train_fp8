@@ -21,10 +21,17 @@ audio_condition:
   enabled: true
   audio_emb_key: vocals_emb_base_all
   audio_emb_root:
-  audio_channels: 768
-  audio_blocks: 12
+  drop_prob: 0.0
+  window_size: 5
+  vae_scale: 4
+  layers: 12
+  input_dim: 768
+  intermediate_dim: 512
+  context_tokens: 32
+  norm_output_audio: true
+  zero_init_audio_output: true
+  mask_clean_first_frame: true
   audio_qk_norm:
-  audio_dropout_prob: 0.0
 num_workers: 1
 
 mixed_precision: true
