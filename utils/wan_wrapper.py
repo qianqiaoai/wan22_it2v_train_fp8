@@ -1,4 +1,3 @@
-import os
 import types
 from contextlib import nullcontext
 from typing import List, Optional, Any, Tuple
@@ -225,7 +224,7 @@ class WanDiffusionWrapper(torch.nn.Module):
             uniform_timestep=False,
             local_attn_size=-1,
             sink_size=0,
-            audio_condition=None,
+        audio_condition=None,
     ):
         super().__init__()
         self.model_name = model_name

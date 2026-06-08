@@ -100,3 +100,6 @@ crop/
 *.prof
 *.lprof
 *.jsonl
+*.wav
+*.png
+*.jpg

@@ -1,0 +1,83 @@
+task: i2v-5B
+generator_type: bidirectional
+generator_name: /Wan2___2-TI2V-5B
+# text_encoder_name is unused; prompt_embeds are loaded from caption_emb files.
+vae_name: /Wan2___2-TI2V-5B
+model_kwargs:
+  timestep_shift: 5.0
+
+data_path: /mnt/data/nlp/user/qiaoqian/newproject/wan2.2_5B_fp8/raw_dataset/talkvid0918_zhibo_9_16_132h_with_audio_path.jsonl
+video_root:
+video_reader: auto
+num_frames: 81
+height: 832
+width: 480
+short_video_policy: pad
+target_fps: 20
+
+load_caption_emb: true
+caption_emb_key: caption_emb
+default_caption_emb_path: /mnt/data/nlp/user/qiaoqian/newproject/wan2.2_5B_fp8/raw_dataset/text_emb/person_speaking_zh_umt5_xxl_bf16.pt
+text_len: 512
+
+audio_condition:
+  enabled: true
+  audio_emb_mode: online
+  audio_emb_key: vocals_emb_base_all
+  audio_emb_root:
+  audio_path_key: audio_path
+  audio_path_root:
+  audio_model_name_or_path: /mnt/data/nlp/user/qiaoqian/models/chinese-wav2vec2-base
+  audio_sample_rate: 16000
+  audio_encoder_device: cpu
+  audio_model_local_files_only: true
+  audio_only_last_features: false
+  drop_prob: 0.0
+  window_size: 5
+  vae_scale: 4
+  layers: 12
+  input_dim: 768
+  intermediate_dim: 512
+  context_tokens: 32
+  norm_output_audio: true
+  zero_init_audio_output: true
+  mask_clean_first_frame: true
+  audio_qk_norm:
+
+num_workers: 1
+
+mixed_precision: true
+fp8: true
+gradient_checkpointing: true
+seed: 0
+
+num_train_timestep: 1000
+
+sharding_strategy: hybrid_full  #
+generator_fsdp_wrap_strategy: size
+# generator_fsdp_min_num_params: 100000000000
+
+batch_size: 1
+gradient_accumulation_steps: 4
+max_steps: 999999
+lr: 3.0e-6
+beta1: 0.0
+beta2: 0.999
+weight_decay: 0.0
+max_grad_norm: 10.0
+# EMA is disabled in trainer.py.
+# ema_start_step: 1000
+
+logdir: logs/rf_final
+log_iters: 500
+save_at_end: true
+disable_swanlab: false
+swanlab_project: wan2.2_5B_fp8
+swanlab_workspace: joeqian
+swanlab_api_key: jPJgUAsHVgIGWvnY5x6D6
+swanlab_api_key_env: SWANLAB_API_KEY
+swanlab_mode: cloud
+swanlab_logdir: /mnt/data/nlp/user/qiaoqian/newproject/wan2.2_5B_fp8/swanlab_logdir
+swanlab_save_api_key: false
+
+# resume_ckpt:

@@ -9,10 +9,15 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 
-def cycle(dataloader):
+def cycle(dataloader, start_epoch: int = 0):
+    epoch = int(start_epoch)
     while True:
+        sampler = getattr(dataloader, "sampler", None)
+        if hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(epoch)
         for batch in dataloader:
             yield batch
+        epoch += 1
 
 
 class JsonlVideoDataset(Dataset):
@@ -36,6 +41,7 @@ class JsonlVideoDataset(Dataset):
         num_frames: int = 81,
         height: int = 832,
         width: int = 480,
+        short_video_policy: str = "error",
         reader: str = "auto",
         max_samples: Optional[int] = None,
         load_caption_emb: bool = True,
@@ -64,6 +70,12 @@ class JsonlVideoDataset(Dataset):
         self.num_frames = int(num_frames)
         self.height = int(height)
         self.width = int(width)
+        self.short_video_policy = str(short_video_policy).lower()
+        if self.short_video_policy not in {"error", "pad"}:
+            raise ValueError(
+                f"Unsupported short_video_policy: {short_video_policy}; "
+                "expected 'error' or 'pad'."
+            )
         self.reader = reader
         self.load_caption_emb = bool(load_caption_emb)
         self.caption_emb_key = caption_emb_key
@@ -172,7 +184,10 @@ class JsonlVideoDataset(Dataset):
                 )
                 output["audio_path"] = item["audio_path"]
             else:
-                output["audio_embeds"] = self._load_audio_embedding(item["audio_emb_path"], frame_start=frame_start)
+                output["audio_embeds"] = self._load_audio_embedding(
+                    item["audio_emb_path"],
+                    frame_start=frame_start,
+                )
                 output["audio_emb_path"] = item["audio_emb_path"]
         if self.load_caption_emb:
             output["prompt_embeds"] = self._load_caption_embedding(item["caption_emb_path"])
@@ -191,7 +206,8 @@ class JsonlVideoDataset(Dataset):
         audio = self._extract_tensor(obj, audio_emb_path)
         audio = torch.as_tensor(audio).float()
         audio = self._normalize_audio_embedding(audio, audio_emb_path)
-        return self._sample_audio_frames(audio, self.num_frames, frame_start=frame_start).contiguous()
+        audio = self._sample_audio_frames(audio, self.num_frames, frame_start=frame_start).contiguous()
+        return audio
 
     def _load_online_audio_embedding(
         self,
@@ -212,7 +228,8 @@ class JsonlVideoDataset(Dataset):
             num_frames=self.num_frames,
         )
         audio = self._normalize_audio_embedding(audio, audio_path)
-        return self._sample_audio_frames(audio, self.num_frames).contiguous()
+        audio = self._sample_audio_frames(audio, self.num_frames).contiguous()
+        return audio
 
     def _get_audio_extractor(self):
         if self._audio_extractor is None:
@@ -256,7 +273,8 @@ class JsonlVideoDataset(Dataset):
                 f"Unsupported caption embedding shape {tuple(caption.shape)} in {caption_emb_path}; "
                 "expected [L, C] or [1, L, C]."
             )
-        return self._pad_or_truncate_caption_embedding(caption, self.text_len).contiguous()
+        caption = self._pad_or_truncate_caption_embedding(caption, self.text_len).contiguous()
+        return caption
 
     @staticmethod
     def _extract_tensor(obj: Any, source: str, preferred_keys: Optional[tuple] = None) -> torch.Tensor:
@@ -381,16 +399,17 @@ class JsonlVideoDataset(Dataset):
     #         raise ValueError(f"Video has no frames: {video_path}")
     #     return video.contiguous()
 
-    @staticmethod
-    def _sample_frames(video: torch.Tensor, num_frames: int, video_path: str):
+    def _sample_frames(self, video: torch.Tensor, num_frames: int, video_path: str):
         total = video.shape[0]
         if total >= num_frames:
             max_start = total - num_frames
             frame_start = int(torch.randint(0, max_start + 1, ()).item()) if max_start > 0 else 0
             frame_end = frame_start + num_frames
             return video[frame_start:frame_end], frame_start, frame_end
-        else:
-            raise ValueError(f"Video has not enough frames ({total} < {num_frames}): {video_path}")
+        if self.short_video_policy == "pad":
+            pad = video[-1:].repeat(num_frames - total, 1, 1, 1)
+            return torch.cat([video, pad], dim=0), 0, total
+        raise ValueError(f"Video has not enough frames ({total} < {num_frames}): {video_path}")
 
     @staticmethod
     def _resize_center_crop(video: torch.Tensor, height: int, width: int) -> torch.Tensor:

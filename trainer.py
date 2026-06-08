@@ -7,11 +7,11 @@ from contextlib import nullcontext
 import torch
 import torch.distributed as dist
 from torch.utils.tensorboard import SummaryWriter
-import wandb
+import swanlab
 from omegaconf import OmegaConf
 
 from fp8 import FP8Context
-from utils.distributed import EMA_FSDP, barrier, fsdp_state_dict, fsdp_wrap, launch_distributed_job
+from utils.distributed import barrier, fsdp_state_dict, fsdp_wrap, launch_distributed_job
 from utils.misc import set_seed
 
 from dataset import JsonlVideoDataset, cycle, worker_init_fn
@@ -33,15 +33,13 @@ class RectifiedFlowTrainer:
         self.device = torch.cuda.current_device()
         self.dtype = torch.bfloat16 if config.mixed_precision else torch.float32
         self.is_main_process = self.global_rank == 0
-        self.disable_wandb = bool(getattr(config, "disable_wandb", False))
+        self.disable_swanlab = bool(getattr(config, "disable_swanlab", False))
         self.output_path = config.logdir
         self.max_grad_norm = float(getattr(config, "max_grad_norm", 10.0))
         self.grad_accum = int(getattr(config, "gradient_accumulation_steps", 1))
         self.max_steps = getattr(config, "max_steps", None)
-        self.previous_time = None
 
         self.fp8 = FP8Context(config)
-        print(f"FP8 enabled: {self.fp8.enabled}")
 
         if config.seed == 0:
             random_seed = torch.randint(0, 10000000, (1,), device=self.device)
@@ -69,6 +67,7 @@ class RectifiedFlowTrainer:
                 min_num_params=int(getattr(config, "text_encoder_fsdp_min_num_params", 5e7)),
                 cpu_offload=bool(getattr(config, "text_encoder_cpu_offload", False)),
             )
+
         self.model.vae = self.model.vae.to(device=self.device, dtype=self.dtype)
         self.model.vae.model.eval()
         self.model.vae.model.encode = torch.compile(self.model.vae.model.encode)
@@ -111,12 +110,7 @@ class RectifiedFlowTrainer:
 
             renamed_n = rename_param(n)
             self.name_to_trainable_params[renamed_n] = p
-        self.ema_weight = config.get("ema_weight", -1.0)
-        self.ema_start_step = config.get("ema_start_step", 0)
-        self.generator_ema = None
-        if (self.ema_weight > 0.0) and (self.step >= self.ema_start_step):
-            print(f"Setting up EMA with weight {self.ema_weight}")
-            self.generator_ema = EMA_FSDP(self.model.generator, decay=self.ema_weight)
+        # EMA is disabled for this run; regular generator checkpoints are enough.
 
         self._maybe_resume()
 
@@ -127,18 +121,25 @@ class RectifiedFlowTrainer:
             os.makedirs(self.output_path, exist_ok=True)
         barrier()
 
-        if self.is_main_process and not self.disable_wandb:
-            wandb.login(host=self.config.wandb_host, key=self.config.wandb_key)
-            wandb.init(
-                config=OmegaConf.to_container(self.config, resolve=True),
-                name=self.config.config_name,
-                mode="online",
-                entity=self.config.wandb_entity,
-                project=self.config.wandb_project,
-                dir=self.config.wandb_save_dir,
+        self.tb_writer = None
+        if self.is_main_process and not self.disable_swanlab:
+            api_key = str(getattr(self.config, "swanlab_api_key", "") or "")
+            if not api_key:
+                api_key = os.environ.get(str(getattr(self.config, "swanlab_api_key_env", "SWANLAB_API_KEY")), "")
+            if api_key:
+                swanlab.login(api_key=api_key, save=bool(getattr(self.config, "swanlab_save_api_key", False)))
+            logged_config = OmegaConf.to_container(self.config, resolve=True)
+            if "swanlab_api_key" in logged_config:
+                logged_config["swanlab_api_key"] = "***"
+            swanlab.init(
+                config=logged_config,
+                experiment_name=getattr(self.config, "swanlab_experiment_name", self.config.config_name),
+                mode=getattr(self.config, "swanlab_mode", "cloud"),
+                project=getattr(self.config, "swanlab_project", "wan2.2_5B_fp8"),
+                workspace=getattr(self.config, "swanlab_workspace", None),
+                logdir=getattr(self.config, "swanlab_logdir", None) or self.output_path,
             )
         else:
-            self.tb_writer = None
             if self.is_main_process:
                 import socket
                 from datetime import datetime
@@ -160,7 +161,14 @@ class RectifiedFlowTrainer:
         else:
             target.model.fp8_context = self.fp8
 
-    def _resume_dataloader(self, dataloader):
+    def _num_consumed_dataloader_batches(self, optimizer_step):
+        return int(optimizer_step) * self.grad_accum
+
+    def _resume_dataloader(self, dataloader=None):
+        if dataloader is None:
+            dataloader = getattr(self, "train_dataloader", None)
+        if dataloader is None:
+            raise ValueError("Cannot resume dataloader before it has been built.")
         batches_per_epoch = len(dataloader)
         if batches_per_epoch <= 0:
             raise ValueError("Cannot resume dataloader because it has no batches.")
@@ -185,22 +193,7 @@ class RectifiedFlowTrainer:
         if not resume_ckpt:
             return
 
-        # Load generator_ema checkpoint (if exists)
-        generator_ema_path = os.path.join(self.config.resume_ckpt, "model_ema.pt")
-        if os.path.exists(generator_ema_path):
-            # Initialize EMA if not already initialized (needed for loading state)
-            if self.generator_ema is None and self.ema_weight > 0.0:
-                print("Initializing EMA for resume...")
-                generator_state_dict = torch.load(generator_ema_path, map_location="cpu")
-                generator_state_dict = {k.replace("_fsdp_wrapped_module.", ""). \
-                                            replace("_checkpoint_wrapped_module.", ""). \
-                                            replace("_orig_mod.", ""): v for k, v in generator_state_dict.items()}
-                # FSDP will automatically handle dtype conversion
-                self.model.generator.load_state_dict(generator_state_dict, strict=True)
-                self.generator_ema = EMA_FSDP(self.model.generator, decay=self.ema_weight)
-                print("Generator EMA checkpoint loaded successfully")
-        else:
-            print(f"Info: Generator EMA checkpoint not found at {generator_ema_path}")
+        # EMA checkpoints are intentionally ignored in this training setup.
 
         # Load generator checkpoint
         generator_path = os.path.join(self.config.resume_ckpt, "model.pt")
@@ -209,13 +202,13 @@ class RectifiedFlowTrainer:
             generator_state_dict = torch.load(generator_path, map_location="cpu")
             # FSDP will automatically handle dtype conversion
             self.model.generator.load_state_dict(generator_state_dict["generator"], strict=True)
-            self.step = int(generator_state_dict["generator"])
+            self.step = int(generator_state_dict.get("step", 0))
             print("Generator checkpoint loaded successfully")
         else:
             print(f"Warning: Generator checkpoint not found at {generator_path}")
 
         if self.step > 0:
-            self._resume_dataloader(self.dataloader)
+            self._resume_dataloader()
 
     def _build_dataloader(self):
         audio_condition = getattr(self.config, "audio_condition", None)
@@ -228,6 +221,7 @@ class RectifiedFlowTrainer:
             num_frames=int(getattr(self.config, "num_frames", 81)),
             height=int(getattr(self.config, "height", 480)),
             width=int(getattr(self.config, "width", 832)),
+            short_video_policy=getattr(self.config, "short_video_policy", "error"),
             target_fps=target_fps,
             reader=getattr(self.config, "video_reader", "auto"),
             max_samples=getattr(self.config, "max_samples", None),
@@ -265,6 +259,7 @@ class RectifiedFlowTrainer:
             )
         dataloader = torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
         self.batches_per_epoch = len(dataloader)
+        self.train_dataloader = dataloader
         if self.is_main_process:
             print(f"DATASET SIZE {self.batches_per_epoch}")
         return cycle(dataloader)
@@ -283,9 +278,6 @@ class RectifiedFlowTrainer:
             torch.save(state, os.path.join(ckpt_dir, "model.pt"))
             OmegaConf.save(self.config, os.path.join(ckpt_dir, "config.yaml"))
             print("Model saved to", os.path.join(ckpt_dir, "model.pt"))
-            if (self.ema_weight > 0.0) and (self.ema_start_step < self.step):
-                torch.save(self.generator_ema.state_dict(), os.path.join(ckpt_dir, "model_ema.pt"))
-            print("EMA Model saved to", os.path.join(ckpt_dir, "model_ema.pt"))
 
     def train_one_step(self):
         # self.model.generator.train()
@@ -294,6 +286,7 @@ class RectifiedFlowTrainer:
 
         total_loss = 0.0
         last_log_dict = None
+        metric_dict = None
         for micro_step in range(self.grad_accum):
             batch = next(self.dataloader)
             frames = batch["frames"].to(device=self.device, dtype=self.dtype, non_blocking=True)
@@ -333,24 +326,19 @@ class RectifiedFlowTrainer:
         self.optimizer.step()
         self.step += 1
 
-        # Create EMA params (if not already created)
-        if (self.step >= self.ema_start_step) and \
-                (self.generator_ema is None) and (self.ema_weight > 0):
-            self.generator_ema = EMA_FSDP(self.model.generator, decay=self.ema_weight)
-
         if self.is_main_process:
             timestep = last_log_dict["timestep"].float()
-            wandb_loss_dict = {
+            metric_dict = {
                 "train/loss": total_loss / self.grad_accum,
                 "train/grad_norm": float(grad_norm.detach().item()),
                 "train/timestep_mean": float(timestep.mean().item()),
                 "train/timestep_min": float(timestep.min().item()),
                 "train/timestep_max": float(timestep.max().item()),
             }
-            if not self.disable_wandb:
-                wandb.log(wandb_loss_dict, step=self.step)
+            if not self.disable_swanlab:
+                swanlab.log(metric_dict, step=self.step)
             else:
-                for k, v in wandb_loss_dict.items():
+                for k, v in metric_dict.items():
                     self.tb_writer.add_scalar(f"train/{k}", v, self.step)
 
         if getattr(self.config, "gc_interval", None) and self.step % int(getattr(self.config, "gc_interval", None)) == 0:
@@ -359,9 +347,56 @@ class RectifiedFlowTrainer:
             torch.cuda.empty_cache()
             gc.collect()
 
+        return metric_dict
+
+    @staticmethod
+    def _format_duration(seconds):
+        seconds = max(0, int(seconds))
+        hours, rem = divmod(seconds, 3600)
+        minutes, seconds = divmod(rem, 60)
+        if hours:
+            return f"{hours:d}h{minutes:02d}m{seconds:02d}s"
+        if minutes:
+            return f"{minutes:d}m{seconds:02d}s"
+        return f"{seconds:d}s"
+
+    def _format_train_log(self, metrics, iter_time):
+        step_text = str(self.step)
+
+        if self.batches_per_epoch:
+            epoch_idx, epoch_step = divmod(self.step, self.batches_per_epoch)
+            epoch_text = str(epoch_idx)
+            epoch_step_text = f"{epoch_step}/{self.batches_per_epoch}"
+        else:
+            epoch_text = "--"
+            epoch_step_text = "--"
+        total_epochs_text = "--"
+        if self.max_steps is not None and self.batches_per_epoch:
+            total_epochs = int(self.max_steps) / self.batches_per_epoch
+            total_epochs_text = f"{total_epochs:.2f}"
+
+        samples_per_iter = self.world_size * int(getattr(self.config, "batch_size", 1)) * self.grad_accum
+        samples_per_sec = samples_per_iter / iter_time if iter_time > 0 else 0.0
+        lr = self.optimizer.param_groups[0]["lr"]
+
+        return (
+            f"epoch={epoch_text} "
+            f"total_epochs={total_epochs_text} "
+            f"step={step_text} "
+            f"epoch_step={epoch_step_text} "
+            f"loss={metrics['train/loss']:.6f} "
+            f"grad_norm={metrics['train/grad_norm']:.4f} "
+            f"lr={lr:.2e} "
+            f"timestep={metrics['train/timestep_mean']:.1f}"
+            f"[{metrics['train/timestep_min']:.1f},{metrics['train/timestep_max']:.1f}] "
+            f"iter={iter_time:.2f}s "
+            f"samples/s={samples_per_sec:.3f}"
+        )
+
     def train(self):
         while self.max_steps is None or self.step < self.max_steps:
-            loss_dict = self.train_one_step()
+            step_start_time = time.time()
+            metric_dict = self.train_one_step()
             if (not self.config.no_save) and self.step % self.config.log_iters == 0:
                 torch.cuda.empty_cache()
                 self.save()
@@ -369,22 +404,20 @@ class RectifiedFlowTrainer:
 
             barrier()
             if self.is_main_process:
-                current_time = time.time()
-                if self.previous_time is not None:
-                    if not self.disable_wandb:
-                        wandb.log({"train/iter_time": current_time - self.previous_time}, step=self.step)
-                    else:
-                        self.tb_writer.add_scalar("perf/per_iteration_time", current_time - self.previous_time, self.step)
-                    print(f"step {self.step} perf/per_iteration_time: ", current_time - self.previous_time, 
-                          f'process: epoch {self.step / self.batches_per_epoch:.3f}')
-                          # ', loss:', loss_dict['train/loss'])
-
-                self.previous_time = current_time
+                iter_time = time.time() - step_start_time
+                if not self.disable_swanlab:
+                    swanlab.log({"train/iter_time": iter_time}, step=self.step)
+                else:
+                    self.tb_writer.add_scalar("perf/per_iteration_time", iter_time, self.step)
+                if metric_dict is not None:
+                    print(self._format_train_log(metric_dict, iter_time), flush=True)
 
         if (not self.config.no_save) and bool(getattr(self.config, "save_at_end", True)):
             self.save()
 
     def close(self):
+        if self.is_main_process and not self.disable_swanlab:
+            swanlab.finish()
         if getattr(self, "tb_writer", None) is not None:
             self.tb_writer.flush()
             self.tb_writer.close()

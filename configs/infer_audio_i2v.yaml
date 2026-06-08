@@ -1,0 +1,46 @@
+checkpoint:
+  checkpoint_dir: /mnt/data/nlp/user/qiaoqian/newproject/wan2.2_5B_fp8/logs/wan2.2_5B_fp8_audio_20260606_120055
+  checkpoint_path: /mnt/data/nlp/user/qiaoqian/newproject/wan2.2_5B_fp8/logs/wan2.2_5B_fp8_audio_20260606_120055/checkpoint_model_007500/model.pt
+
+model:
+  base_model_dir: /mnt/data/nlp/user/qiaoqian/models/Wan2.2-TI2V-5B
+  fp8: true
+
+data:
+  inference_dir: /mnt/data/nlp/user/qiaoqian/newproject/wan2.2_5B_fp8/inference_data
+  audio_dir: null
+  audio_source_path: /mnt/data/nlp/user/qiaoqian/newproject/wan2.2_5B_fp8/inference_data/audio/podcast_yue.wav
+  ref_dir: null
+  prompt_file: null
+  text_emb_path: /mnt/data/nlp/user/qiaoqian/newproject/wan2.2_5B_fp8/raw_dataset/text_emb/person_speaking_zh_umt5_xxl_bf16.pt
+  negative_text_emb_path: /mnt/data/nlp/user/qiaoqian/newproject/wan2.2_5B_fp8/raw_dataset/text_emb/wan2_2_negative_prompt_umt5_xxl_bf16.pt
+
+output:
+  output_dir: null
+
+generation:
+  width: 480
+  height: 832
+  frame_num: 81
+  fps: 20
+  sample_steps: 50
+  shift: null
+  guide_scale: 5.0
+  cfg_mode: text
+  seed: 42
+  pairing: match
+  merge_audio: true
+
+audio:
+  segment_mode: sequential
+  start_time: 0.0
+  stride: null
+  skip_incomplete_segments: true
+
+runtime:
+  max_jobs: null
+  device: cuda
+  dtype: bf16
+  dry_run: false
+  local_files_only: true
+  allow_remote_audio_model: false
