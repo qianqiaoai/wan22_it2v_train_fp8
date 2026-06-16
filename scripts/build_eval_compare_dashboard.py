@@ -7,11 +7,12 @@ import warnings
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-TARGET = REPO_ROOT / 'debug/scripts/debug_fsdp_init.py'
+TARGET = REPO_ROOT / "auto_eval/eval_agent/workflows/compare_dashboard_workflow.py"
 
 if __name__ == "__main__":
     warnings.warn(
-        f"{Path(__file__).name} is deprecated at scripts/; use {TARGET.relative_to(REPO_ROOT)} instead.",
+        f"{Path(__file__).name} is deprecated at scripts/; use "
+        "python auto_eval/eval_digital_human_agent.py compare dashboard ... instead.",
         DeprecationWarning,
         stacklevel=2,
     )

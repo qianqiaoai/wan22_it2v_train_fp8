@@ -18,6 +18,7 @@ target_fps: 20
 load_caption_emb: true
 caption_emb_key: caption_emb
 default_caption_emb_path: /mnt/data/nlp/user/qiaoqian/newproject/wan2.2_5B_fp8/raw_dataset/text_emb/person_speaking_zh_umt5_xxl_bf16.pt
+caption_emb_mode: fixed  # fixed: all use default; fallback: row caption_emb if present, default if missing
 text_len: 512
 
 audio_condition:
@@ -32,7 +33,7 @@ audio_condition:
   audio_encoder_device: cpu
   audio_model_local_files_only: true
   audio_only_last_features: false
-  drop_prob: 0.0
+  p_audio_drop: 0.1
   window_size: 5
   vae_scale: 4
   layers: 12
@@ -50,6 +51,9 @@ mixed_precision: true
 fp8: true
 gradient_checkpointing: true
 seed: 0
+generator_trainable_modules:
+  - audio_proj
+  - audio_cross_attn
 
 num_train_timestep: 1000
 
@@ -59,8 +63,12 @@ generator_fsdp_wrap_strategy: size
 
 batch_size: 1
 gradient_accumulation_steps: 4
-max_steps: 999999
-lr: 3.0e-6
+max_steps: 12000
+lr: 1.0e-5
+lr_scheduler: cosine
+warmup_steps: 200
+lr_decay_steps: 12000
+min_lr_ratio: 0.1
 beta1: 0.0
 beta2: 0.999
 weight_decay: 0.0

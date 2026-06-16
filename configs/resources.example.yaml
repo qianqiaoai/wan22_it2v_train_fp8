@@ -1,0 +1,27 @@
+# Copy this file as resources.local.yaml.
+# Replace the placeholder with your own absolute resource directory.
+# The relative paths below are examples and may be changed to match local files.
+pretrained_root: "<ABS_PATH_TO_EVAL_AGENT_PRETRAINED>"
+
+resources:
+  dwpose:
+    adapter: dwpose_onnx
+    detector_model_relpath: dwpose/yolox_l.onnx
+    pose_model_relpath: dwpose/dw-ll_ucoco_384.onnx
+    provider: cpu
+
+  syncnet:
+    adapter: syncnet_v2
+    model_relpath: syncnet/syncnet_v2.model
+
+  facesim:
+    adapter: insightface_antelopev2
+    model_root_relpath: insightface
+    model_pack: antelopev2
+    provider: cpu
+
+  vbench_quality:
+    adapter: vbench_local
+    model_root_relpath: .
+    device: cpu
+    offline: true

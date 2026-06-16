@@ -29,8 +29,8 @@ class JsonlVideoDataset(Dataset):
     Returns video tensors in [C, T, H, W], normalized to [-1, 1].
     Caption embeddings are padded/truncated to text_len and returned as
     prompt_embeds, so training does not need to run the T5 text encoder.
-    If default_caption_emb_path is set, rows without caption_emb use that
-    fallback embedding.
+    caption_emb_mode controls whether rows always use the default embedding,
+    use row embeddings with a default fallback, or require row embeddings.
     """
 
     def __init__(
@@ -48,6 +48,7 @@ class JsonlVideoDataset(Dataset):
         caption_emb_key: str = "caption_emb",
         caption_emb_root: Optional[str] = None,
         default_caption_emb_path: Optional[str] = None,
+        caption_emb_mode: str = "fallback",
         text_len: int = 512,
         load_audio_emb: bool = False,
         audio_emb_mode: str = "offline",
@@ -79,11 +80,14 @@ class JsonlVideoDataset(Dataset):
         self.reader = reader
         self.load_caption_emb = bool(load_caption_emb)
         self.caption_emb_key = caption_emb_key
+        self.caption_emb_mode = self._normalize_caption_emb_mode(caption_emb_mode)
         self.default_caption_emb_path = None
         if default_caption_emb_path:
             self.default_caption_emb_path = str(self._resolve_path(default_caption_emb_path, self.caption_emb_root))
             if not Path(self.default_caption_emb_path).exists():
                 raise FileNotFoundError(f"default_caption_emb_path not found: {self.default_caption_emb_path}")
+        if self.load_caption_emb and self.caption_emb_mode == "fixed" and not self.default_caption_emb_path:
+            raise ValueError("caption_emb_mode='fixed' requires default_caption_emb_path")
         self.text_len = int(text_len)
         if self.text_len <= 0:
             raise ValueError(f"text_len must be positive, got {text_len}")
@@ -130,10 +134,15 @@ class JsonlVideoDataset(Dataset):
                 sample = {"video": str(video_path), "caption": str(row.get("caption", "")), "idx": len(samples)}
                 if self.load_caption_emb:
                     caption_emb_value = row.get(self.caption_emb_key)
-                    if caption_emb_value:
-                        sample["caption_emb_path"] = str(self._resolve_path(caption_emb_value, self.caption_emb_root))
-                    elif self.default_caption_emb_path:
+                    if self.caption_emb_mode == "fixed":
                         sample["caption_emb_path"] = self.default_caption_emb_path
+                        sample["caption_emb_source"] = "default"
+                    elif caption_emb_value:
+                        sample["caption_emb_path"] = str(self._resolve_path(caption_emb_value, self.caption_emb_root))
+                        sample["caption_emb_source"] = "row"
+                    elif self.caption_emb_mode == "fallback" and self.default_caption_emb_path:
+                        sample["caption_emb_path"] = self.default_caption_emb_path
+                        sample["caption_emb_source"] = "default"
                     else:
                         raise ValueError(
                             f"Expected caption embedding key '{self.caption_emb_key}' at "
@@ -192,6 +201,7 @@ class JsonlVideoDataset(Dataset):
         if self.load_caption_emb:
             output["prompt_embeds"] = self._load_caption_embedding(item["caption_emb_path"])
             output["caption_emb_path"] = item["caption_emb_path"]
+            output["caption_emb_source"] = item.get("caption_emb_source", "row")
         return output
 
     @staticmethod
@@ -200,6 +210,27 @@ class JsonlVideoDataset(Dataset):
         if root and not path.is_absolute():
             path = root / path
         return path
+
+    @staticmethod
+    def _normalize_caption_emb_mode(mode: str) -> str:
+        mode = str(mode).lower()
+        aliases = {
+            "fixed": "fixed",
+            "default": "fixed",
+            "all_default": "fixed",
+            "force_default": "fixed",
+            "fallback": "fallback",
+            "default_fallback": "fallback",
+            "missing_fallback": "fallback",
+            "row": "row",
+            "jsonl": "row",
+        }
+        if mode not in aliases:
+            raise ValueError(
+                f"Unsupported caption_emb_mode: {mode}; "
+                "expected 'fixed', 'fallback', or 'row'."
+            )
+        return aliases[mode]
 
     def _load_audio_embedding(self, audio_emb_path: str, frame_start: int = 0) -> torch.Tensor:
         obj = torch.load(audio_emb_path, map_location="cpu")

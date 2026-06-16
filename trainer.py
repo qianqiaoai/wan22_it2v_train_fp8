@@ -1,5 +1,6 @@
 import gc
 import logging
+import math
 import os
 import time
 from contextlib import nullcontext
@@ -94,6 +95,7 @@ class RectifiedFlowTrainer:
             )
         else:
             raise ValueError(f"Unsupported optimizer_type: {optimizer_type}")
+        self.base_lrs = [float(group["lr"]) for group in self.optimizer.param_groups]
 
         self.dataloader = self._build_dataloader()
 
@@ -113,8 +115,35 @@ class RectifiedFlowTrainer:
         # EMA is disabled for this run; regular generator checkpoints are enough.
 
         self._maybe_resume()
-
         torch.cuda.empty_cache()
+
+    def _lr_factor_for_step(self, step):
+        scheduler = str(getattr(self.config, "lr_scheduler", "constant")).lower()
+        warmup_steps = int(getattr(self.config, "warmup_steps", 0))
+        min_lr_ratio = float(getattr(self.config, "min_lr_ratio", 0.0))
+        if not 0.0 <= min_lr_ratio <= 1.0:
+            raise ValueError(f"min_lr_ratio must be in [0, 1], got {min_lr_ratio}")
+
+        if warmup_steps > 0 and step <= warmup_steps:
+            return max(float(step), 1.0) / float(warmup_steps)
+
+        if scheduler in {"constant", "none"}:
+            return 1.0
+        if scheduler != "cosine":
+            raise ValueError(f"Unsupported lr_scheduler: {scheduler}")
+
+        decay_steps = int(getattr(self.config, "lr_decay_steps", self.max_steps or warmup_steps))
+        if decay_steps <= warmup_steps:
+            return 1.0
+        progress = (float(step) - warmup_steps) / float(decay_steps - warmup_steps)
+        progress = min(1.0, max(0.0, progress))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+    def _set_optimizer_lr_for_step(self, step):
+        factor = self._lr_factor_for_step(step)
+        for group, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
+            group["lr"] = base_lr * factor
 
     def _init_logging(self):
         if self.is_main_process:
@@ -229,6 +258,7 @@ class RectifiedFlowTrainer:
             caption_emb_key=getattr(self.config, "caption_emb_key", "caption_emb"),
             caption_emb_root=getattr(self.config, "caption_emb_root", None),
             default_caption_emb_path=getattr(self.config, "default_caption_emb_path", None),
+            caption_emb_mode=getattr(self.config, "caption_emb_mode", "fallback"),
             text_len=int(getattr(self.config, "text_len", 512)),
             load_audio_emb=load_audio_emb,
             audio_emb_mode=getattr(audio_condition, "audio_emb_mode", "offline") if audio_condition is not None else "offline",
@@ -282,6 +312,7 @@ class RectifiedFlowTrainer:
     def train_one_step(self):
         # self.model.generator.train()
         # self.model.vae.eval()
+        self._set_optimizer_lr_for_step(self.step + 1)
         self.optimizer.zero_grad(set_to_none=True)
 
         total_loss = 0.0
@@ -331,6 +362,7 @@ class RectifiedFlowTrainer:
             metric_dict = {
                 "train/loss": total_loss / self.grad_accum,
                 "train/grad_norm": float(grad_norm.detach().item()),
+                "train/lr": float(self.optimizer.param_groups[0]["lr"]),
                 "train/timestep_mean": float(timestep.mean().item()),
                 "train/timestep_min": float(timestep.min().item()),
                 "train/timestep_max": float(timestep.max().item()),

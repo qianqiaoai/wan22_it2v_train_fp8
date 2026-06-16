@@ -7,7 +7,7 @@ import warnings
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-TARGET = REPO_ROOT / 'debug/scripts/debug_fsdp_init.py'
+TARGET = REPO_ROOT / 'auto_eval/eval_agent/workflows/legacy/dwpose_admission_review.py'
 
 if __name__ == "__main__":
     warnings.warn(

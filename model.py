@@ -19,8 +19,18 @@ class RectifiedFlowFineTuneModel(nn.Module):
         audio_condition = getattr(config, "audio_condition", None)
         self.audio_condition_enabled = bool(getattr(audio_condition, "enabled", False)) if audio_condition is not None else False
         self.audio_dropout_prob = float(
-            getattr(audio_condition, "drop_prob", getattr(audio_condition, "audio_dropout_prob", getattr(audio_condition, "dropout_prob", 0.0)))
+            getattr(
+                audio_condition,
+                "p_audio_drop",
+                getattr(
+                    audio_condition,
+                    "drop_prob",
+                    getattr(audio_condition, "audio_dropout_prob", getattr(audio_condition, "dropout_prob", 0.0)),
+                ),
+            )
         ) if audio_condition is not None else 0.0
+        if not 0.0 <= self.audio_dropout_prob <= 1.0:
+            raise ValueError(f"audio dropout probability must be in [0, 1], got {self.audio_dropout_prob}")
         self.mask_clean_first_audio = bool(
             getattr(audio_condition, "mask_clean_first_frame", True)
         ) if audio_condition is not None else True
@@ -35,6 +45,7 @@ class RectifiedFlowFineTuneModel(nn.Module):
             # is_causal=self.generator_type == "causal",
         )
         self._set_generator_trainable(True)
+        self._apply_generator_trainable_filter()
 
         if getattr(config, "gradient_checkpointing", False):
             self.generator.enable_gradient_checkpointing()
@@ -56,6 +67,49 @@ class RectifiedFlowFineTuneModel(nn.Module):
         else:
             self.generator.model.requires_grad_(trainable)
 
+    def _apply_generator_trainable_filter(self):
+        patterns = getattr(self.config, "generator_trainable_modules", None)
+        if patterns is None:
+            patterns = getattr(self.config, "trainable_modules", None)
+        if patterns is None:
+            return
+
+        if isinstance(patterns, str):
+            patterns = [patterns]
+        patterns = [str(pattern) for pattern in patterns if str(pattern)]
+        if not patterns:
+            return
+
+        self.generator.requires_grad_(False)
+        matched = {pattern: 0 for pattern in patterns}
+        trainable_count = 0
+        trainable_numel = 0
+        total_numel = 0
+        for name, param in self.generator.named_parameters():
+            total_numel += param.numel()
+            should_train = any(pattern in name for pattern in patterns)
+            param.requires_grad_(should_train)
+            if not should_train:
+                continue
+            trainable_count += 1
+            trainable_numel += param.numel()
+            for pattern in patterns:
+                if pattern in name:
+                    matched[pattern] += 1
+
+        missing = [pattern for pattern, count in matched.items() if count == 0]
+        if missing:
+            raise ValueError(
+                "generator_trainable_modules did not match any parameters: "
+                + ", ".join(missing)
+            )
+
+        print(
+            "Generator trainable filter enabled: "
+            f"patterns={patterns}, trainable_tensors={trainable_count}, "
+            f"trainable_numel={trainable_numel}, total_numel={total_numel}"
+        )
+
     @torch.no_grad()
     def encode_video(self, frames: torch.Tensor) -> torch.Tensor:
         return self.vae.encode_to_latent(frames).to(device=self.device, dtype=self.dtype)
@@ -74,9 +128,12 @@ class RectifiedFlowFineTuneModel(nn.Module):
                 raise ValueError("audio_condition.enabled is true, but batch does not contain audio_embeds")
             audio_embeds = audio_embeds.to(device=self.device, dtype=self.dtype)
             if self.training and self.audio_dropout_prob > 0.0:
-                keep_shape = (audio_embeds.shape[0],) + (1,) * (audio_embeds.ndim - 1)
-                keep = torch.rand(keep_shape, device=audio_embeds.device) >= self.audio_dropout_prob
-                audio_embeds = audio_embeds * keep.to(dtype=audio_embeds.dtype)
+                p_audio_drop = self.audio_dropout_prob
+                is_drop = (torch.rand(audio_embeds.shape[0], device=audio_embeds.device) < p_audio_drop)
+                is_drop = is_drop.to(audio_embeds.dtype)
+                audio_embeds = audio_embeds * (1 - is_drop).reshape(
+                    (-1,) + (1,) * (audio_embeds.ndim - 1)
+                ).type_as(audio_embeds)
         else:
             audio_embeds = None
 

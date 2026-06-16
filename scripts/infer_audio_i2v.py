@@ -49,6 +49,7 @@ DEFAULT_ARGS: Dict[str, Any] = {
     "inference_dir": DEFAULT_INFERENCE_DIR,
     "audio_dir": None,
     "audio_source_path": None,
+    "job_manifest": None,
     "audio_segment_mode": "per_job",
     "audio_segment_start": 0.0,
     "audio_segment_stride": None,
@@ -87,6 +88,7 @@ CONFIG_ALIASES = {
     "data.inference_dir": "inference_dir",
     "data.audio_dir": "audio_dir",
     "data.audio_source_path": "audio_source_path",
+    "data.job_manifest": "job_manifest",
     "data.ref_dir": "ref_dir",
     "data.prompt_file": "prompt_file",
     "data.text_emb_path": "text_emb_path",
@@ -125,6 +127,7 @@ PATH_KEYS = {
     "inference_dir",
     "audio_dir",
     "audio_source_path",
+    "job_manifest",
     "ref_dir",
     "prompt_file",
     "text_emb_path",
@@ -194,6 +197,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--inference_dir", type=Path)
     parser.add_argument("--audio_dir", type=Path)
     parser.add_argument("--audio_source_path", type=Path)
+    parser.add_argument(
+        "--job_manifest",
+        type=Path,
+        help="Optional key-preserving materialized benchmark manifest. Overrides audio/ref directory pairing.",
+    )
     parser.add_argument("--audio_segment_mode", choices=("per_job", "sequential", "fixed"))
     parser.add_argument("--audio_segment_start", type=float)
     parser.add_argument("--audio_segment_stride", type=float)
@@ -210,7 +218,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample_steps", type=int)
     parser.add_argument("--shift", type=float)
     parser.add_argument("--guide_scale", type=float)
-    parser.add_argument("--cfg_mode", choices=("off", "text", "zero"))
+    parser.add_argument("--cfg_mode", choices=("off", "text", "audio", "both", "zero"))
     parser.add_argument("--seed", type=int)
     parser.add_argument("--max_jobs", type=int)
     parser.add_argument("--device", type=str)
@@ -305,6 +313,72 @@ def build_jobs(
     unmatched_refs = [str(p) for p in ref_files if str(p) not in selected_ref_paths]
     warnings = {"unmatched_audio": unmatched_audio, "unused_refs": unmatched_refs}
     return jobs, warnings
+
+
+def _load_jsonl(path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def _job_manifest_path(row: Dict[str, Any], *keys: str) -> Optional[Path]:
+    for key in keys:
+        value = row.get(key)
+        if value:
+            return Path(str(value))
+    return None
+
+
+def build_jobs_from_manifest(job_manifest: Path, max_jobs: Optional[int]) -> Tuple[List[Dict[str, Any]], Dict[str, List[str]]]:
+    if not job_manifest.exists():
+        raise FileNotFoundError(f"Job manifest does not exist: {job_manifest}")
+    rows = _load_jsonl(job_manifest)
+    jobs: List[Dict[str, Any]] = []
+    invalid_rows: List[str] = []
+    for index, row in enumerate(rows):
+        benchmark_key = row.get("benchmark_key") or row.get("key")
+        ref = _job_manifest_path(row, "materialized_ref", "prepared_ref", "ref")
+        audio = _job_manifest_path(row, "materialized_audio", "audio_segment", "audio")
+        if not benchmark_key or ref is None or audio is None:
+            invalid_rows.append(json.dumps({"row_index": index, "benchmark_key": benchmark_key}, ensure_ascii=False))
+            continue
+        generated_sample_id = row.get("generated_sample_id") or f"generated_{index + 1:04d}"
+        job = {
+            "key": str(generated_sample_id),
+            "generated_sample_id": str(generated_sample_id),
+            "benchmark_key": str(benchmark_key),
+            "benchmark_row_index": row.get("benchmark_row_index"),
+            "benchmark_row_hash": row.get("benchmark_row_hash"),
+            "audio": audio,
+            "ref": ref,
+            "prompt": row.get("prompt", ""),
+            "materialized_ref": str(ref),
+            "materialized_audio": str(audio),
+            "materialized_target_clip": row.get("materialized_target_clip"),
+            "original_imgpath": row.get("original_imgpath"),
+            "original_videopath": row.get("original_videopath"),
+            "original_wav_path": row.get("original_wav_path"),
+            "original_posepath": row.get("original_posepath"),
+            "conditioning": row.get("conditioning") or {
+                "reference_mode": "materialized_ref",
+                "audio_mode": "materialized_audio",
+            },
+            "generation": {
+                "width": row.get("generation_width"),
+                "height": row.get("generation_height"),
+                "fps": row.get("generation_fps"),
+                "frame_num": row.get("generation_frame_num"),
+            },
+            "source_manifest_row": row,
+        }
+        jobs.append(job)
+    if max_jobs is not None:
+        jobs = jobs[: max(0, int(max_jobs))]
+    return jobs, {"unmatched_audio": invalid_rows, "unused_refs": []}
 
 
 def audio_duration_seconds(path: Path) -> Optional[float]:
@@ -641,6 +715,14 @@ def run_sampling(
             raise ValueError("cfg_mode=text requires negative_text_embeds")
         uncond = {"prompt_embeds": negative_text_embeds}
         uncond_audio = audio_embeds
+    elif args.cfg_mode == "audio":
+        uncond = {"prompt_embeds": text_embeds}
+        uncond_audio = torch.zeros_like(audio_embeds)
+    elif args.cfg_mode == "both":
+        if negative_text_embeds is None:
+            raise ValueError("cfg_mode=both requires negative_text_embeds")
+        uncond = {"prompt_embeds": negative_text_embeds}
+        uncond_audio = torch.zeros_like(audio_embeds)
     elif args.cfg_mode == "zero":
         uncond = {"prompt_embeds": torch.zeros_like(text_embeds)}
         uncond_audio = torch.zeros_like(audio_embeds)
@@ -690,6 +772,38 @@ def write_manifest(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def key_preserving_manifest_fields(job: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
+    conditioning = dict(job.get("conditioning") or {})
+    generation = dict(job.get("generation") or {})
+    return {
+        "generated_sample_id": job.get("generated_sample_id") or job.get("key"),
+        "benchmark_key": job.get("benchmark_key"),
+        "benchmark_row_index": job.get("benchmark_row_index"),
+        "benchmark_row_hash": job.get("benchmark_row_hash"),
+        "materialized_ref": job.get("materialized_ref") or str(job.get("ref")),
+        "materialized_audio": job.get("materialized_audio") or str(job.get("audio")),
+        "materialized_target_clip": job.get("materialized_target_clip"),
+        "original_imgpath": job.get("original_imgpath"),
+        "original_videopath": job.get("original_videopath"),
+        "original_wav_path": job.get("original_wav_path"),
+        "original_posepath": job.get("original_posepath"),
+        "conditioning": {
+            "reference_mode": conditioning.get("reference_mode", "materialized_ref"),
+            "audio_mode": conditioning.get("audio_mode", "materialized_audio"),
+        },
+        "generation": {
+            "width": generation.get("width") or args.width,
+            "height": generation.get("height") or args.height,
+            "fps": generation.get("fps") or args.fps,
+            "frame_num": generation.get("frame_num") or args.frame_num,
+        },
+        "generation_width": generation.get("width") or args.width,
+        "generation_height": generation.get("height") or args.height,
+        "generation_fps": generation.get("fps") or args.fps,
+        "generation_frame_num": generation.get("frame_num") or args.frame_num,
+    }
+
+
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
@@ -707,7 +821,14 @@ def main() -> None:
     audio_segment_out_dir = output_dir / "audio_segments"
 
     prompts = read_prompts(prompt_file if prompt_file.exists() else None)
-    jobs, warnings = build_jobs(audio_dir, ref_dir, prompts, args.pairing, args.max_jobs)
+    if args.job_manifest is not None:
+        jobs, warnings = build_jobs_from_manifest(args.job_manifest, args.max_jobs)
+        # A key-preserving job manifest already carries per-sample materialized audio.
+        # Do not let a legacy global audio_source_path from the YAML override it.
+        args.audio_source_path = None
+        args.audio_segment_mode = "per_job"
+    else:
+        jobs, warnings = build_jobs(audio_dir, ref_dir, prompts, args.pairing, args.max_jobs)
     jobs, audio_warnings = apply_audio_segments(args, jobs)
 
     logging.info("Checkpoint: %s", checkpoint_path)
@@ -720,6 +841,10 @@ def main() -> None:
     logging.info("Jobs: %d", len(jobs))
     if args.guide_scale != 1.0 and args.cfg_mode == "off":
         logging.warning("guide_scale=%s is ignored because cfg_mode=off.", args.guide_scale)
+    if args.cfg_mode == "both":
+        logging.warning("cfg_mode=both enables text CFG and audio CFG by using negative text and zero audio as uncond.")
+    if args.cfg_mode == "audio":
+        logging.warning("cfg_mode=audio enables audio CFG only by using the same text and zero audio as uncond.")
     if args.cfg_mode == "zero":
         logging.warning("cfg_mode=zero uses an untrained zero-text/zero-audio branch; cfg_mode=text is preferred.")
     if warnings["unmatched_audio"]:
@@ -732,22 +857,37 @@ def main() -> None:
     dry_rows: List[Dict[str, Any]] = []
     for job in jobs[: max(0, min(len(jobs), args.max_jobs or len(jobs)))]:
         ref_image = prepare_ref_image(job["ref"], args.width, args.height)
+        planned_video_path = video_out_dir / f"{job['key']}.mp4"
+        planned_audio_segment_path = audio_segment_out_dir / f"{job['key']}.wav"
+        planned_ref_path = ref_out_dir / f"{job['key']}.png"
         row = {
             "key": job["key"],
+            **key_preserving_manifest_fields(job, args),
             "audio": str(job["audio"]),
             "audio_source": str(job["audio_source"]),
             "audio_start_time": job["audio_start_time"],
             "audio_end_time": job["audio_end_time"],
             "audio_duration": job["audio_duration"],
+            "audio_segment": str(planned_audio_segment_path),
             "ref": str(job["ref"]),
+            "prepared_ref": str(planned_ref_path),
             "prompt": job.get("prompt", ""),
             "prepared_ref_size": list(ref_image.size),
             "checkpoint": str(checkpoint_path),
+            "video": str(planned_video_path),
+            "generated_video": str(planned_video_path),
+            "dry_run": True,
+            "generated_video_exists": False,
         }
         dry_rows.append(row)
 
     if args.dry_run:
         logging.info("Dry run only; model is not loaded.")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        ref_out_dir.mkdir(parents=True, exist_ok=True)
+        video_out_dir.mkdir(parents=True, exist_ok=True)
+        audio_segment_out_dir.mkdir(parents=True, exist_ok=True)
+        write_manifest(output_dir / "manifest.jsonl", dry_rows)
         for row in dry_rows:
             logging.info(
                 "Planned job %s: audio_source=%s audio=[%.3f, %.3f] ref=%s prepared_ref_size=%s",
@@ -772,7 +912,7 @@ def main() -> None:
     model = load_model(args, checkpoint_path, config, device)
     text_embeds = load_text_embedding(args.text_emb_path, text_len=512, dtype=dtype, device=device)
     negative_text_embeds = None
-    if args.cfg_mode == "text" and args.guide_scale != 1.0:
+    if args.cfg_mode in {"text", "both"} and args.guide_scale != 1.0:
         negative_text_embeds = load_text_embedding(args.negative_text_emb_path, text_len=512, dtype=dtype, device=device)
     audio_extractor = build_audio_extractor(config, device, local_files_only=local_files_only)
 
@@ -810,6 +950,7 @@ def main() -> None:
 
         row = {
             "key": key,
+            **key_preserving_manifest_fields(job, args),
             "audio": str(job["audio"]),
             "audio_source": str(job["audio_source"]),
             "audio_start_time": job["audio_start_time"],
@@ -822,7 +963,12 @@ def main() -> None:
             "text_emb_path": str(args.text_emb_path),
             "checkpoint": str(checkpoint_path),
             "seed": job_seed,
+            "cfg_mode": args.cfg_mode,
+            "guide_scale": args.guide_scale,
             "video": str(video_path),
+            "generated_video": str(video_path),
+            "dry_run": False,
+            "generated_video_exists": video_path.exists(),
         }
         manifest_rows.append(row)
         write_manifest(output_dir / "manifest.jsonl", manifest_rows)

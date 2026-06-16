@@ -1,0 +1,58 @@
+profile_name: example_audio_ref_text2video
+profile_version: v1
+adapter_type: yaml_field_map
+
+benchmark_root: null
+
+field_map:
+  reference_image: reference
+  target_video: video
+  audio: audio_file
+  pose: pose_file
+  prompt: caption
+  text: text_prompt
+  category: metadata.category
+  body: metadata.body
+
+required_fields:
+  - reference_image
+  - target_video
+  - audio
+
+optional_fields:
+  - pose
+  - prompt
+  - text
+  - category
+  - body
+
+key_policy:
+  type: derived_row_hash_key
+  explicit_fields:
+    - uid
+    - benchmark_key
+  hash_fields:
+    - reference_image
+    - target_video
+    - audio
+    - pose
+    - prompt
+    - text
+
+path_policy:
+  allow_absolute: false
+  resolve_relative_to: benchmark_root
+
+task_profile:
+  name: example_profile
+  requires_reference_image: true
+  requires_audio: true
+  target_video_comparable: true
+
+media_policy:
+  width: 480
+  height: 832
+  fps: 20
+  frame_num: 81
+  duration_sec: 4.05
+  resize_policy: profile_defined

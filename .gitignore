@@ -103,3 +103,6 @@ crop/
 *.wav
 *.png
 *.jpg
+eval_*/
+*.json
+*.csv
