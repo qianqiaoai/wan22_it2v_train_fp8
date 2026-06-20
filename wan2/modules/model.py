@@ -269,6 +269,69 @@ class WanCrossAttention(WanSelfAttention):
         return x
 
 
+class WanAudioCrossAttention(nn.Module):
+    def __init__(
+        self,
+        dim,
+        context_dim,
+        num_heads,
+        qk_norm=False,
+        eps=1e-6,
+    ):
+        super().__init__()
+        assert dim % num_heads == 0
+        self.dim = dim
+        self.context_dim = context_dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.qk_norm = qk_norm
+        self.eps = eps
+
+        if USE_TE:
+            self.q = te.Linear(dim, dim, bias=True)
+            self.kv = te.Linear(context_dim, dim * 2, bias=True)
+            self.o = te.Linear(dim, dim, bias=True)
+            self.te_dpa = te.DotProductAttention(
+                num_attention_heads=self.num_heads,
+                kv_channels=self.head_dim,
+                attention_dropout=0.0,
+                attn_mask_type="no_mask",
+                qkv_format="bshd",
+            )
+            patch_te_extra_state(self)
+        else:
+            self.q = nn.Linear(dim, dim)
+            self.kv = nn.Linear(context_dim, dim * 2)
+            self.o = nn.Linear(dim, dim)
+
+        self.norm_q = WanRMSNorm(self.head_dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_k = WanRMSNorm(self.head_dim, eps=eps) if qk_norm else nn.Identity()
+
+    def forward(self, x, context, context_lens=None):
+        r"""
+        Args:
+            x(Tensor): Shape [B, L1, C]
+            context(Tensor): Shape [B, L2, audio_context_dim]
+            context_lens(Tensor): Shape [B]
+        """
+        b, n, d = x.size(0), self.num_heads, self.head_dim
+
+        q = te_linear_padded(self.q, x).view(b, -1, n, d)
+        kv = te_linear_padded(self.kv, context).view(b, -1, 2, n, d)
+        k, v = kv.unbind(dim=2)
+        q = self.norm_q(q)
+        k = self.norm_k(k)
+
+        if USE_TE:
+            x = self.te_dpa(q, k, v, qkv_format="bshd", attn_mask_type="no_mask")
+        else:
+            x = flash_attention(q, k, v, k_lens=context_lens)
+
+        x = x.flatten(2)
+        x = te_linear_padded(self.o, x)
+        return x
+
+
 class AudioProjModel(nn.Module):
     def __init__(
         self,
@@ -358,6 +421,7 @@ class WanAttentionBlock(nn.Module):
                                             eps)
         self.audio_norm = None
         self.audio_cross_attn = None
+        self.audio_context_dim = None
         self.norm2 = WanLayerNorm(dim, eps)
         if USE_TE:
             self.ffn = nn.Sequential(
@@ -372,13 +436,22 @@ class WanAttentionBlock(nn.Module):
         # modulation
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
-    def enable_audio_conditioning(self, audio_qk_norm=None, zero_init_output=True):
+    def enable_audio_conditioning(self, audio_qk_norm=None, zero_init_output=False):
         if self.audio_cross_attn is not None:
             return
-        qk_norm = self.qk_norm if audio_qk_norm is None else bool(audio_qk_norm)
+        # Old implementation inherited visual/text attention qk_norm:
+        # qk_norm = self.qk_norm if audio_qk_norm is None else bool(audio_qk_norm)
+        qk_norm = False if audio_qk_norm is None else bool(audio_qk_norm)
         self.audio_norm = WanLayerNorm(self.dim, self.eps, elementwise_affine=True)
-        self.audio_cross_attn = WanCrossAttention(
-            self.dim, self.num_heads, (-1, -1), qk_norm, self.eps)
+        if self.audio_context_dim is None:
+            raise ValueError("audio_context_dim must be set before enabling audio conditioning")
+        # Old implementation expected audio tokens to already be in hidden dim:
+        # self.audio_cross_attn = WanCrossAttention(
+        #     self.dim, self.num_heads, (-1, -1), qk_norm, self.eps)
+        self.audio_cross_attn = WanAudioCrossAttention(
+            self.dim, self.audio_context_dim, self.num_heads, qk_norm, self.eps)
+        # Old default zero-initialized the audio attention output projection:
+        # zero_init_output=True
         if zero_init_output:
             nn.init.zeros_(self.audio_cross_attn.o.weight)
             if self.audio_cross_attn.o.bias is not None:
@@ -400,7 +473,9 @@ class WanAttentionBlock(nn.Module):
             if audio.shape[0] < frames:
                 pad = audio[-1:].expand(frames - audio.shape[0], -1, -1)
                 audio = torch.cat([audio, pad], dim=0)
-            audio = audio[:frames].reshape(frames, -1, self.dim).to(device=x.device, dtype=x.dtype)
+            # Old implementation reshaped to self.dim because AudioProjModel emitted hidden-dim tokens:
+            # audio = audio[:frames].reshape(frames, -1, self.dim).to(device=x.device, dtype=x.dtype)
+            audio = audio[:frames].reshape(frames, -1, self.audio_context_dim).to(device=x.device, dtype=x.dtype)
 
             visual = self.audio_norm(x[sample_idx:sample_idx + 1, :seq_len])
             visual = visual.reshape(1, frames, height * width, self.dim).reshape(frames, height * width, self.dim)
@@ -649,7 +724,7 @@ class WanModel(ModelMixin, ConfigMixin):
         intermediate_dim=512,
         context_tokens=32,
         norm_output_audio=True,
-        zero_init_audio_output=True,
+        zero_init_audio_output=False,
         audio_qk_norm=None,
     ):
         self.audio_window = int(audio_window)
@@ -657,17 +732,21 @@ class WanModel(ModelMixin, ConfigMixin):
         self.audio_layers = int(audio_layers)
         self.audio_dim = int(audio_dim)
         self.audio_context_tokens = int(context_tokens)
+        self.audio_context_dim = self.audio_dim
         self.audio_proj = AudioProjModel(
             audio_window=self.audio_window,
             vae_scale=self.audio_vae_scale,
             audio_layers=self.audio_layers,
             audio_dim=self.audio_dim,
             intermediate_dim=intermediate_dim,
-            output_dim=self.dim,
+            # Old implementation projected audio tokens directly to DiT hidden dim:
+            # output_dim=self.dim,
+            output_dim=self.audio_context_dim,
             context_tokens=self.audio_context_tokens,
             norm_output_audio=norm_output_audio,
         )
         for block in self.blocks:
+            block.audio_context_dim = self.audio_context_dim
             block.enable_audio_conditioning(
                 audio_qk_norm=audio_qk_norm,
                 zero_init_output=zero_init_audio_output)

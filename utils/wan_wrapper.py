@@ -285,7 +285,9 @@ class WanDiffusionWrapper(torch.nn.Module):
             intermediate_dim=int(self._cfg_first(cfg, ("intermediate_dim", "audio_intermediate_dim"), 512)),
             context_tokens=int(self._cfg_first(cfg, ("context_tokens", "audio_context_tokens"), 32)),
             norm_output_audio=self._cfg_bool(cfg, "norm_output_audio", True),
-            zero_init_audio_output=self._cfg_bool(cfg, "zero_init_audio_output", True),
+            # Old default zero-initialized audio attention output projection:
+            # zero_init_audio_output=self._cfg_bool(cfg, "zero_init_audio_output", True),
+            zero_init_audio_output=self._cfg_bool(cfg, "zero_init_audio_output", False),
             audio_qk_norm=self._cfg_get(cfg, "audio_qk_norm", None),
         )
 

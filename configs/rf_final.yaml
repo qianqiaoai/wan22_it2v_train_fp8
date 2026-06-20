@@ -33,17 +33,21 @@ audio_condition:
   audio_encoder_device: cpu
   audio_model_local_files_only: true
   audio_only_last_features: false
-  p_audio_drop: 0.1
-  window_size: 5
+  # p_audio_drop: 0.1
+  p_audio_drop: 0.0
+  # window_size: 5
+  window_size: 3
   vae_scale: 4
   layers: 12
   input_dim: 768
   intermediate_dim: 512
   context_tokens: 32
   norm_output_audio: true
+  # zero_init_audio_output: false
   zero_init_audio_output: true
   mask_clean_first_frame: true
-  audio_qk_norm:
+  # audio_qk_norm:
+  audio_qk_norm: false
 
 num_workers: 1
 
@@ -63,12 +67,16 @@ generator_fsdp_wrap_strategy: size
 
 batch_size: 1
 gradient_accumulation_steps: 4
-max_steps: 12000
+# max_steps: 50000
+max_steps: 70000
 lr: 1.0e-5
 lr_scheduler: cosine
-warmup_steps: 200
-lr_decay_steps: 12000
-min_lr_ratio: 0.1
+# warmup_steps: 200
+warmup_steps: 500
+# lr_decay_steps: 12000
+lr_decay_steps: 70000
+# min_lr_ratio: 0.1
+min_lr_ratio: 0.2
 beta1: 0.0
 beta2: 0.999
 weight_decay: 0.0
