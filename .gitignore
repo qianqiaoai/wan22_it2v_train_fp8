@@ -95,7 +95,7 @@ tmp/
 temp/
 *.removed_*.txt
 crop/
-
+joy_vl_*
 # Compiled / profiling
 *.prof
 *.lprof
@@ -106,3 +106,5 @@ crop/
 eval_*/
 *.json
 *.csv
+inference_results/
+*.tsv

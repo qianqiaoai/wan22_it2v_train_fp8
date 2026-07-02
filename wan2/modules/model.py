@@ -304,8 +304,11 @@ class WanAudioCrossAttention(nn.Module):
             self.kv = nn.Linear(context_dim, dim * 2)
             self.o = nn.Linear(dim, dim)
 
-        self.norm_q = WanRMSNorm(self.head_dim, eps=eps) if qk_norm else nn.Identity()
-        self.norm_k = WanRMSNorm(self.head_dim, eps=eps) if qk_norm else nn.Identity()
+        # Old implementation normalized after splitting heads:
+        # self.norm_q = WanRMSNorm(self.head_dim, eps=eps) if qk_norm else nn.Identity()
+        # self.norm_k = WanRMSNorm(self.head_dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
     def forward(self, x, context, context_lens=None):
         r"""
@@ -316,11 +319,16 @@ class WanAudioCrossAttention(nn.Module):
         """
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
-        q = te_linear_padded(self.q, x).view(b, -1, n, d)
-        kv = te_linear_padded(self.kv, context).view(b, -1, 2, n, d)
-        k, v = kv.unbind(dim=2)
-        q = self.norm_q(q)
-        k = self.norm_k(k)
+        # Old implementation:
+        # q = te_linear_padded(self.q, x).view(b, -1, n, d)
+        # kv = te_linear_padded(self.kv, context).view(b, -1, 2, n, d)
+        # k, v = kv.unbind(dim=2)
+        # q = self.norm_q(q)
+        # k = self.norm_k(k)
+        q = self.norm_q(te_linear_padded(self.q, x)).view(b, -1, n, d)
+        k, v = te_linear_padded(self.kv, context).chunk(2, dim=-1)
+        k = self.norm_k(k).view(b, -1, n, d)
+        v = v.view(b, -1, n, d)
 
         if USE_TE:
             x = self.te_dpa(q, k, v, qkv_format="bshd", attn_mask_type="no_mask")
@@ -705,6 +713,27 @@ class WanModel(ModelMixin, ConfigMixin):
         self.init_weights()
 
         self.gradient_checkpointing = False
+
+    def reset_patch_io(self, in_dim, out_dim, patch_size):
+        device = self.patch_embedding.weight.device
+        dtype = self.patch_embedding.weight.dtype
+        patch_size = tuple(int(v) for v in patch_size)
+        self.in_dim = int(in_dim)
+        self.out_dim = int(out_dim)
+        self.patch_size = patch_size
+
+        self.patch_embedding = nn.Conv3d(
+            self.in_dim, self.dim, kernel_size=patch_size, stride=patch_size)
+        self.patch_embedding.to(device=device, dtype=dtype)
+        nn.init.xavier_uniform_(self.patch_embedding.weight.flatten(1))
+        if self.patch_embedding.bias is not None:
+            nn.init.zeros_(self.patch_embedding.bias)
+
+        self.head = Head(self.dim, self.out_dim, patch_size, self.eps)
+        self.head.to(device=device, dtype=dtype)
+        nn.init.zeros_(self.head.head.weight)
+        if self.head.head.bias is not None:
+            nn.init.zeros_(self.head.head.bias)
 
     def _set_gradient_checkpointing(self, module, value=False):
         self.gradient_checkpointing = value

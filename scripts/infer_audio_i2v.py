@@ -646,7 +646,12 @@ def load_model(args: argparse.Namespace, checkpoint_path: Path, config, device: 
     config = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
     base_model_dir = resolve_base_model_dir(config, args.base_model_dir)
     config.generator_name = str(base_model_dir)
-    config.vae_name = str(base_model_dir)
+    vae_type = str(getattr(config, "vae_type", "wan5b")).lower()
+    configured_vae_name = getattr(config, "vae_name", None)
+    if configured_vae_name is None or (
+        vae_type in {"wan5b", "wan2.2", "wan2_2", "wan"} and not Path(str(configured_vae_name)).exists()
+    ):
+        config.vae_name = str(base_model_dir)
     config.gradient_checkpointing = False
     config.mixed_precision = args.dtype == "bf16"
     if not args.fp8:
@@ -657,7 +662,8 @@ def load_model(args: argparse.Namespace, checkpoint_path: Path, config, device: 
     target_dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
     model.generator.to(device=device, dtype=target_dtype)
     model.vae.to(device=device, dtype=target_dtype)
-    model.vae.model.to(device=device, dtype=target_dtype)
+    if hasattr(model.vae, "model"):
+        model.vae.model.to(device=device, dtype=target_dtype)
 
     if args.fp8:
         attach_fp8(config, model.generator)
@@ -665,7 +671,7 @@ def load_model(args: argparse.Namespace, checkpoint_path: Path, config, device: 
     logging.info("Loading generator checkpoint: %s", checkpoint_path)
     state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     generator_state = state["generator"] if isinstance(state, dict) and "generator" in state else state
-    load_result = model.generator.load_state_dict(generator_state, strict=True)
+    load_result = model.load_generator_state_dict_for_current_vae(generator_state, strict=True)
     logging.info("Generator checkpoint load result: %s", load_result)
     logging.info(
         "Generator checkpoint tensors: %d; fingerprint: %s",
@@ -676,10 +682,16 @@ def load_model(args: argparse.Namespace, checkpoint_path: Path, config, device: 
     return model
 
 
-def make_i2v_timestep(mask2: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
+def generator_patch_size(generator) -> Tuple[int, int, int]:
+    target = generator.model0 if getattr(generator, "dual_exp", False) else generator.model
+    return tuple(int(v) for v in getattr(target, "patch_size", (1, 2, 2)))
+
+
+def make_i2v_timestep(mask2: torch.Tensor, timestep: torch.Tensor, patch_size: Tuple[int, int, int]) -> torch.Tensor:
     if mask2.ndim == 5:
         mask2 = mask2[0]
-    return (mask2[:, 0, ::2, ::2] * timestep).flatten().unsqueeze(0)
+    pt, ph, pw = patch_size
+    return (mask2[::pt, 0, ::ph, ::pw] * timestep).flatten().unsqueeze(0)
 
 
 @torch.no_grad()
@@ -730,10 +742,11 @@ def run_sampling(
         uncond = None
         uncond_audio = None
     batch_size, latent_frames = latent.shape[:2]
+    patch_size = generator_patch_size(model.generator)
 
     for step_index, timestep_value in enumerate(scheduler.timesteps):
         timestep_value = timestep_value.to(device=device, dtype=dtype)
-        timestep = make_i2v_timestep(mask2, timestep_value)
+        timestep = make_i2v_timestep(mask2, timestep_value, patch_size=patch_size)
         flow_pred = model.generator(
             latent,
             cond,
@@ -760,9 +773,8 @@ def run_sampling(
         latent = (1.0 - mask2) * clean_latent + mask2 * latent
         logging.info("Sampling step %d/%d done", step_index + 1, len(scheduler.timesteps))
 
-    z = latent[0].permute(1, 0, 2, 3).unsqueeze(0).to(device=device, dtype=dtype)
-    model.vae.scale = [item.to(device=device, dtype=dtype) for item in model.vae.scale]
-    video = model.vae.model.decode(z, model.vae.scale).clamp(-1, 1).float().cpu()
+    decoded = model.vae.decode_to_pixel(latent.to(device=device, dtype=dtype))
+    video = decoded.permute(0, 2, 1, 3, 4).float().cpu()
     return video
 
 

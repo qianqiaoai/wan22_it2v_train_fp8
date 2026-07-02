@@ -1,0 +1,31 @@
+<!doctype html><meta charset="utf-8"><title>ckpt010500 736x1280 CFG 对比</title><style>
+body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;background:#f6f7f9;color:#17202a}.wrap{max-width:1480px;margin:0 auto;padding:24px}h1{font-size:24px;margin:0 0 8px}.note{background:#fff;border:1px solid #d9dee7;border-radius:10px;padding:14px;margin:12px 0 22px;line-height:1.6}.case{background:#fff;border:1px solid #dfe4ec;border-radius:12px;padding:16px;margin:16px 0;box-shadow:0 1px 4px rgba(0,0,0,.05)}.case h2{font-size:18px;margin:0 0 12px}.grid{display:grid;grid-template-columns:220px 1fr 1fr;gap:14px;align-items:start}.ref img{width:100%;max-height:330px;object-fit:contain;background:#111;border-radius:8px}.card{border:1px solid #e3e7ee;border-radius:10px;padding:10px;background:#fbfcfe}.card h3{font-size:15px;margin:0 0 8px}.card video{width:100%;max-height:520px;background:#111;border-radius:8px}.meta{font-size:13px;color:#52606d;line-height:1.5;margin-top:8px;word-break:break-all}@media(max-width:900px){.grid{grid-template-columns:1fr}.card video{max-height:none}}
+</style><div class="wrap">
+<h1>checkpoint_model_010500：5 组参考图/音频推理预览</h1>
+<div class="note"><b>尺寸说明：</b>732 不是 32 的倍数，因此这里使用 <b>736x1280</b>。原生推理按 checkpoint 训练配置 <b>480x832 / 20fps / 81 frames</b> 完成，再后处理为 736x1280。直接原生 720p/736p 需要额外适配模型 token/seq_len 逻辑，本轮未改模型代码。</div>
+<section class="case"><h2>样本 0001</h2><div class="grid">
+<div class="ref"><h3>参考图</h3><img src="inputs/ref_5/01.png"><div class="meta">音频：01.wav</div></div>
+<div class="card"><h3>无 CFG</h3><video controls preload="metadata" src="no_cfg_736x1280_resized/videos/0001.mp4"></video><div class="meta">视频：0001.mp4<br>输出：736x1280，20fps，81帧；音频已合入视频。</div></div>
+<div class="card"><h3>Text CFG=3.0</h3><video controls preload="metadata" src="textcfg3_736x1280_resized/videos/0001.mp4"></video><div class="meta">视频：0001.mp4<br>输出：736x1280，20fps，81帧；音频已合入视频。</div></div>
+</div></section>
+<section class="case"><h2>样本 0002</h2><div class="grid">
+<div class="ref"><h3>参考图</h3><img src="inputs/ref_5/02.png"><div class="meta">音频：02.wav</div></div>
+<div class="card"><h3>无 CFG</h3><video controls preload="metadata" src="no_cfg_736x1280_resized/videos/0002.mp4"></video><div class="meta">视频：0002.mp4<br>输出：736x1280，20fps，81帧；音频已合入视频。</div></div>
+<div class="card"><h3>Text CFG=3.0</h3><video controls preload="metadata" src="textcfg3_736x1280_resized/videos/0002.mp4"></video><div class="meta">视频：0002.mp4<br>输出：736x1280，20fps，81帧；音频已合入视频。</div></div>
+</div></section>
+<section class="case"><h2>样本 0003</h2><div class="grid">
+<div class="ref"><h3>参考图</h3><img src="inputs/ref_5/03.png"><div class="meta">音频：03.wav</div></div>
+<div class="card"><h3>无 CFG</h3><video controls preload="metadata" src="no_cfg_736x1280_resized/videos/0003.mp4"></video><div class="meta">视频：0003.mp4<br>输出：736x1280，20fps，81帧；音频已合入视频。</div></div>
+<div class="card"><h3>Text CFG=3.0</h3><video controls preload="metadata" src="textcfg3_736x1280_resized/videos/0003.mp4"></video><div class="meta">视频：0003.mp4<br>输出：736x1280，20fps，81帧；音频已合入视频。</div></div>
+</div></section>
+<section class="case"><h2>样本 0004</h2><div class="grid">
+<div class="ref"><h3>参考图</h3><img src="inputs/ref_5/04.png"><div class="meta">音频：04.wav</div></div>
+<div class="card"><h3>无 CFG</h3><video controls preload="metadata" src="no_cfg_736x1280_resized/videos/0004.mp4"></video><div class="meta">视频：0004.mp4<br>输出：736x1280，20fps，81帧；音频已合入视频。</div></div>
+<div class="card"><h3>Text CFG=3.0</h3><video controls preload="metadata" src="textcfg3_736x1280_resized/videos/0004.mp4"></video><div class="meta">视频：0004.mp4<br>输出：736x1280，20fps，81帧；音频已合入视频。</div></div>
+</div></section>
+<section class="case"><h2>样本 0005</h2><div class="grid">
+<div class="ref"><h3>参考图</h3><img src="inputs/ref_5/05.png"><div class="meta">音频：05.wav</div></div>
+<div class="card"><h3>无 CFG</h3><video controls preload="metadata" src="no_cfg_736x1280_resized/videos/0005.mp4"></video><div class="meta">视频：0005.mp4<br>输出：736x1280，20fps，81帧；音频已合入视频。</div></div>
+<div class="card"><h3>Text CFG=3.0</h3><video controls preload="metadata" src="textcfg3_736x1280_resized/videos/0005.mp4"></video><div class="meta">视频：0005.mp4<br>输出：736x1280，20fps，81帧；音频已合入视频。</div></div>
+</div></section>
+</div>

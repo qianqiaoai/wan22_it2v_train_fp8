@@ -1,15 +1,12 @@
 task: i2v-5B
 generator_type: bidirectional
-generator_name: /Wan2___2-TI2V-5B
+generator_name: /mnt/data/nlp/user/qiaoqian/models/Wan2.2-TI2V-5B
 # text_encoder_name is unused; prompt_embeds are loaded from caption_emb files.
-vae_type: wan5b  # wan5b or ltx2
-vae_name: /Wan2___2-TI2V-5B
-# For LTX-2 VAE:
-# vae_type: ltx2
-# vae_name: /mnt/data/nlp/user/qiaoqian/newproject/wan2.2_5B_fp8/vae_ckpts
-# ltx2_repo_path: /mnt/data/nlp/user/qiaoqian/newproject/LTX-2
-# ltx2_encoder_checkpoint_name: ltx2_video_vae_encoder.safetensors
-# ltx2_decoder_checkpoint_name: ltx2_video_vae_decoder.safetensors
+vae_type: ltx2
+vae_name: /mnt/data/nlp/user/qiaoqian/newproject/wan2.2_5B_fp8/vae_ckpts
+ltx2_repo_path: /mnt/data/nlp/user/qiaoqian/newproject/LTX-2
+ltx2_encoder_checkpoint_name: ltx2_video_vae_encoder.safetensors
+ltx2_decoder_checkpoint_name: ltx2_video_vae_decoder.safetensors
 # LTX-2 VAE uses latent channels=128, DiT patch_size=(1, 1, 1), audio vae_scale=8.
 # The code reinitializes incompatible patch_embedding/head.head and trains them.
 model_kwargs:
@@ -43,10 +40,10 @@ audio_condition:
   audio_model_local_files_only: true
   audio_only_last_features: false
   # p_audio_drop: 0.1
-  p_audio_drop: 0.0
+  p_audio_drop: 0.1
   # window_size: 5
-  window_size: 3
-  vae_scale: 4
+  window_size: 5
+  vae_scale: 8
   layers: 12
   input_dim: 768
   intermediate_dim: 512
@@ -65,10 +62,14 @@ mixed_precision: true
 fp8: true
 gradient_checkpointing: true
 seed: 0
-generator_trainable_modules:
-  - audio_proj
-  - audio_cross_attn
-  - audio_norm
+# Full generator finetuning: leave generator_trainable_modules unset.
+# Adapter-only setting kept for reference:
+# generator_trainable_modules:
+#   - audio_proj
+#   - audio_cross_attn
+#   - audio_norm
+#   - patch_embedding
+#   - head.head
 
 num_train_timestep: 1000
 
@@ -77,10 +78,10 @@ generator_fsdp_wrap_strategy: size
 # generator_fsdp_min_num_params: 100000000000
 
 batch_size: 1
-gradient_accumulation_steps: 4
+gradient_accumulation_steps: 8
 # max_steps: 50000
 max_steps: 70000
-lr: 2.0e-5
+lr: 5.0e-5
 lr_scheduler: cosine
 # warmup_steps: 200
 warmup_steps: 500

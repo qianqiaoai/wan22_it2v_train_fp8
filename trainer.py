@@ -67,11 +67,14 @@ class RectifiedFlowTrainer:
                 wrap_strategy=config.text_encoder_fsdp_wrap_strategy,
                 min_num_params=int(getattr(config, "text_encoder_fsdp_min_num_params", 5e7)),
                 cpu_offload=bool(getattr(config, "text_encoder_cpu_offload", False)),
-            )
+        )
 
         self.model.vae = self.model.vae.to(device=self.device, dtype=self.dtype)
-        self.model.vae.model.eval()
-        self.model.vae.model.encode = torch.compile(self.model.vae.model.encode)
+        if hasattr(self.model.vae, "model"):
+            self.model.vae.model.eval()
+            self.model.vae.model.encode = torch.compile(self.model.vae.model.encode)
+        else:
+            self.model.vae.eval()
         # compile_mode = getattr(config, "compile_vae_mode", "reduce-overhead")
         # print("----Compiling VAE with torch.compile(mode=%s).", compile_mode)
         # self.model.vae.model = torch.compile(self.model.vae.model, mode=compile_mode)
@@ -230,7 +233,7 @@ class RectifiedFlowTrainer:
             print(f"Loading generator from {generator_path}")
             generator_state_dict = torch.load(generator_path, map_location="cpu")
             # FSDP will automatically handle dtype conversion
-            self.model.generator.load_state_dict(generator_state_dict["generator"], strict=True)
+            self.model.load_generator_state_dict_for_current_vae(generator_state_dict["generator"], strict=True)
             self.step = int(generator_state_dict.get("step", 0))
             print("Generator checkpoint loaded successfully")
         else:

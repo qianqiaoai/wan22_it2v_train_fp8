@@ -1,5 +1,8 @@
 import types
+import os
+import sys
 from contextlib import nullcontext
+from pathlib import Path
 from typing import List, Optional, Any, Tuple
 import torch
 from torch import nn
@@ -58,6 +61,9 @@ class Wan2_2_VAEWrapper(torch.nn.Module):
     def __init__(self, model_name="Wan2___2-TI2V-5B"):
         super().__init__()
         self.model_name = model_name
+        self.vae_type = "wan5b"
+        self.latent_channels = 48
+        self.latent_patch_size = (1, 1, 1)
         self.mean = torch.tensor([
             -0.2289,-0.0052,-0.1323,-0.2339,-0.2799,0.0174,0.1838,0.1557,
             -0.1382,0.0542,0.2813,0.0891,0.1570,-0.0098,0.0375,-0.1825,
@@ -104,11 +110,166 @@ class Wan2_2_VAEWrapper(torch.nn.Module):
         output = output.permute(0, 2, 1, 3, 4)
         return output
 
+    def decode_to_pixel(self, latent: torch.Tensor, use_cache: bool = False) -> torch.Tensor:
+        # latent: [batch_size, num_frames, num_channels, height, width]
+        # output: [batch_size, num_frames, num_channels, height, width]
+        if use_cache and not hasattr(self.model, "cached_decode"):
+            raise NotImplementedError("Wan2_2_VAEWrapper does not expose cached_decode")
+        zs = latent.permute(0, 2, 1, 3, 4)
+
+        device, dtype = latent.device, latent.dtype
+        self.scale = [_.to(device=device, dtype=dtype) for _ in self.scale]
+        decode_function = self.model.cached_decode if use_cache else self.model.decode
+
+        output = []
+        for u in zs:
+            output.append(decode_function(u.unsqueeze(0), self.scale).float().clamp_(-1, 1).squeeze(0))
+        output = torch.stack(output, dim=0)
+        output = output.permute(0, 2, 1, 3, 4)
+        return output
+
+
+class LTX2VideoVAEWrapper(torch.nn.Module):
+    def __init__(
+        self,
+        model_name="/mnt/data/nlp/user/qiaoqian/models/LTX-2.3",
+        checkpoint_name: Optional[str] = None,
+        encoder_checkpoint_name: Optional[str] = None,
+        decoder_checkpoint_name: Optional[str] = None,
+        repo_path: Optional[str] = None,
+        dtype: torch.dtype = torch.float32,
+    ):
+        super().__init__()
+        self.model_name = str(model_name)
+        self.vae_type = "ltx2"
+        self.latent_channels = 128
+        self.latent_patch_size = (1, 2, 2)
+        self.vae_stride = (8, 32, 32)
+        self.target_video_length = 81
+        self.dtype = dtype
+
+        self.repo_path = self._resolve_repo_path(repo_path)
+        self.encoder_checkpoint_path, self.decoder_checkpoint_path = self._resolve_checkpoint_paths(
+            self.model_name,
+            checkpoint_name,
+            encoder_checkpoint_name,
+            decoder_checkpoint_name,
+        )
+        self.checkpoint_path = self.encoder_checkpoint_path
+        load_video_vae_encoder, load_video_vae_decoder = self._load_ltx2_loader(self.repo_path)
+
+        self.encoder = load_video_vae_encoder(
+            self.encoder_checkpoint_path, device="cpu", dtype=dtype).eval().requires_grad_(False)
+        self.decoder = load_video_vae_decoder(
+            self.decoder_checkpoint_path, device="cpu", dtype=dtype).eval().requires_grad_(False)
+
+    @staticmethod
+    def _resolve_repo_path(repo_path: Optional[str]) -> Optional[Path]:
+        repo_path = repo_path or os.environ.get("LTX2_REPO_PATH")
+        if repo_path:
+            return Path(repo_path)
+        default_repo = Path("/mnt/data/nlp/user/qiaoqian/newproject/LTX-2")
+        return default_repo if default_repo.exists() else None
+
+    @staticmethod
+    def _resolve_checkpoint_path(model_name: str, checkpoint_name: Optional[str]) -> str:
+        model_path = Path(model_name)
+        if model_path.is_file():
+            return str(model_path)
+        if not model_path.exists():
+            raise FileNotFoundError(f"LTX2 VAE path does not exist: {model_path}")
+        if checkpoint_name:
+            checkpoint_path = model_path / checkpoint_name
+            if not checkpoint_path.exists():
+                raise FileNotFoundError(f"LTX2 VAE checkpoint does not exist: {checkpoint_path}")
+            return str(checkpoint_path)
+
+        preferred_names = (
+            "ltx-2.3-22b-dev.safetensors",
+            "ltx-2.3-22b-distilled.safetensors",
+        )
+        for name in preferred_names:
+            checkpoint_path = model_path / name
+            if checkpoint_path.exists():
+                return str(checkpoint_path)
+
+        candidates = sorted(model_path.glob("*.safetensors"))
+        if not candidates:
+            raise FileNotFoundError(f"No safetensors checkpoint found under LTX2 VAE path: {model_path}")
+        return str(candidates[0])
+
+    @classmethod
+    def _resolve_checkpoint_paths(
+        cls,
+        model_name: str,
+        checkpoint_name: Optional[str],
+        encoder_checkpoint_name: Optional[str],
+        decoder_checkpoint_name: Optional[str],
+    ) -> Tuple[str, str]:
+        model_path = Path(model_name)
+        if encoder_checkpoint_name or decoder_checkpoint_name:
+            if not model_path.exists() or model_path.is_file():
+                raise ValueError("Separate LTX2 encoder/decoder checkpoint names require model_name to be a directory")
+            encoder_name = encoder_checkpoint_name or checkpoint_name
+            decoder_name = decoder_checkpoint_name or checkpoint_name
+            if encoder_name is None or decoder_name is None:
+                raise ValueError("Both LTX2 encoder and decoder checkpoint names must be provided")
+            encoder_path = model_path / encoder_name
+            decoder_path = model_path / decoder_name
+            if not encoder_path.exists():
+                raise FileNotFoundError(f"LTX2 VAE encoder checkpoint does not exist: {encoder_path}")
+            if not decoder_path.exists():
+                raise FileNotFoundError(f"LTX2 VAE decoder checkpoint does not exist: {decoder_path}")
+            return str(encoder_path), str(decoder_path)
+
+        if model_path.is_dir():
+            split_encoder = model_path / "ltx2_video_vae_encoder.safetensors"
+            split_decoder = model_path / "ltx2_video_vae_decoder.safetensors"
+            if split_encoder.exists() and split_decoder.exists():
+                return str(split_encoder), str(split_decoder)
+
+        checkpoint_path = cls._resolve_checkpoint_path(model_name, checkpoint_name)
+        return checkpoint_path, checkpoint_path
+
+    @staticmethod
+    def _load_ltx2_loader(repo_path: Optional[Path]):
+        if repo_path is not None:
+            for rel_path in ("packages/ltx-core/src", "packages/ltx-trainer/src"):
+                package_path = repo_path / rel_path
+                if package_path.exists() and str(package_path) not in sys.path:
+                    sys.path.insert(0, str(package_path))
+        try:
+            from ltx_trainer.model_loader import load_video_vae_decoder, load_video_vae_encoder
+        except ImportError as exc:
+            raise ImportError(
+                "Cannot import LTX-2 VAE loaders. Set config.ltx2_repo_path or LTX2_REPO_PATH "
+                "to the local LTX-2 repository."
+            ) from exc
+        return load_video_vae_encoder, load_video_vae_decoder
+
+    def encode_to_latent(self, pixel: torch.Tensor) -> torch.Tensor:
+        # pixel: [batch_size, num_channels, num_frames, height, width], normalized to [-1, 1]
+        weight = next(self.encoder.parameters())
+        pixel = pixel.to(device=weight.device, dtype=weight.dtype)
+        latent = self.encoder(pixel)
+        return latent.permute(0, 2, 1, 3, 4)
+
+    def decode_to_pixel(self, latent: torch.Tensor, use_cache: bool = False) -> torch.Tensor:
+        if use_cache:
+            raise NotImplementedError("LTX2VideoVAEWrapper does not expose cached_decode")
+        weight = next(self.decoder.parameters())
+        latent = latent.permute(0, 2, 1, 3, 4).to(device=weight.device, dtype=weight.dtype)
+        video = self.decoder(latent).float().clamp_(-1, 1)
+        return video.permute(0, 2, 1, 3, 4)
+
 
 class Wan2_1_VAEWrapper(torch.nn.Module):
     def __init__(self, model_name="Wan2.1-T2V-14B"):
         super().__init__()
         self.model_name = model_name
+        self.vae_type = "wan2_1"
+        self.latent_channels = 16
+        self.latent_patch_size = (1, 1, 1)
         mean = [
             -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
             0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921
@@ -297,6 +458,11 @@ class WanDiffusionWrapper(torch.nn.Module):
         else:
             self.model0.enable_gradient_checkpointing()
             self.model1.enable_gradient_checkpointing()
+
+    def reset_patch_io(self, in_dim, out_dim, patch_size):
+        targets = [self.model0, self.model1] if self.dual_exp else [self.model]
+        for target in targets:
+            target.reset_patch_io(in_dim=in_dim, out_dim=out_dim, patch_size=patch_size)
 
     def _convert_flow_pred_to_x0(self, flow_pred: torch.Tensor, xt: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
         """

@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from utils.wan_wrapper import WanDiffusionWrapper, Wan2_1_VAEWrapper, Wan2_2_VAEWrapper
+from utils.wan_wrapper import LTX2VideoVAEWrapper, WanDiffusionWrapper, Wan2_1_VAEWrapper, Wan2_2_VAEWrapper
 from wan2.utils.utils import masks_like
 
 
@@ -37,6 +37,10 @@ class RectifiedFlowFineTuneModel(nn.Module):
 
         model_name = getattr(config, "generator_name", getattr(config, "model_name", "Wan2.1-T2V-1.3B"))
         vae_name = getattr(config, "vae_name", model_name)
+        vae_type = str(getattr(config, "vae_type", "wan5b")).lower()
+        vae_profile = self._vae_profile(vae_type)
+        self.vae_type = vae_type
+        self._configure_audio_for_vae(audio_condition, vae_profile)
 
         self.generator = WanDiffusionWrapper(
             **getattr(config, "model_kwargs", {}),
@@ -44,7 +48,9 @@ class RectifiedFlowFineTuneModel(nn.Module):
             audio_condition=audio_condition,
             # is_causal=self.generator_type == "causal",
         )
+        self._configure_generator_for_vae(vae_profile)
         self._set_generator_trainable(True)
+        self._ensure_vae_trainable_modules(vae_type)
         self._apply_generator_trainable_filter()
 
         if getattr(config, "gradient_checkpointing", False):
@@ -53,12 +59,158 @@ class RectifiedFlowFineTuneModel(nn.Module):
         # Text conditions are loaded from precomputed caption_emb files by the dataset.
         self.text_encoder = None
 
-        WanVAEWrapper = Wan2_2_VAEWrapper
-        self.vae = WanVAEWrapper(model_name=vae_name)
+        self.vae = self._build_vae(vae_type=vae_type, vae_name=vae_name)
         self.vae.requires_grad_(False)
+        self._validate_vae_generator_compatibility()
 
         self.scheduler = self.generator.get_scheduler()
         self.scheduler.timesteps = self.scheduler.timesteps.to(device)
+
+    def _build_vae(self, vae_type: str, vae_name: str):
+        if vae_type in {"wan5b", "wan2.2", "wan2_2", "wan"}:
+            return Wan2_2_VAEWrapper(model_name=vae_name)
+        if vae_type in {"ltx2", "ltx2vae", "ltx-2", "ltx"}:
+            return LTX2VideoVAEWrapper(
+                model_name=vae_name,
+                checkpoint_name=getattr(self.config, "ltx2_checkpoint_name", None),
+                encoder_checkpoint_name=getattr(self.config, "ltx2_encoder_checkpoint_name", None),
+                decoder_checkpoint_name=getattr(self.config, "ltx2_decoder_checkpoint_name", None),
+                repo_path=getattr(self.config, "ltx2_repo_path", None),
+            )
+        if vae_type in {"wan2.1", "wan2_1"}:
+            return Wan2_1_VAEWrapper(model_name=vae_name)
+        raise ValueError(f"Unsupported vae_type={vae_type!r}. Expected one of: wan5b, ltx2, wan2_1")
+
+    @staticmethod
+    def _vae_profile(vae_type: str):
+        if vae_type in {"wan5b", "wan2.2", "wan2_2", "wan"}:
+            return {"latent_channels": 48, "patch_size": (1, 2, 2), "audio_vae_scale": 4}
+        if vae_type in {"ltx2", "ltx2vae", "ltx-2", "ltx"}:
+            return {"latent_channels": 128, "patch_size": (1, 1, 1), "audio_vae_scale": 8}
+        if vae_type in {"wan2.1", "wan2_1"}:
+            return {"latent_channels": 16, "patch_size": (1, 2, 2), "audio_vae_scale": 4}
+        return {"latent_channels": None, "patch_size": None, "audio_vae_scale": None}
+
+    @staticmethod
+    def _uses_ltx2_vae(vae_type: str) -> bool:
+        return vae_type in {"ltx2", "ltx2vae", "ltx-2", "ltx"}
+
+    def _configure_audio_for_vae(self, audio_condition, vae_profile):
+        if audio_condition is None or vae_profile.get("audio_vae_scale") is None:
+            return
+        target_scale = int(vae_profile["audio_vae_scale"])
+        audio_condition.vae_scale = target_scale
+        audio_condition.audio_vae_scale = target_scale
+
+    def _configure_generator_for_vae(self, vae_profile):
+        latent_channels = vae_profile.get("latent_channels")
+        patch_size = vae_profile.get("patch_size")
+        if latent_channels is None or patch_size is None:
+            return
+        generator_model = self.generator.model0 if getattr(self.generator, "dual_exp", False) else self.generator.model
+        current_patch_size = tuple(getattr(generator_model, "patch_size", ()))
+        if (
+            int(getattr(generator_model, "in_dim", -1)) == int(latent_channels)
+            and int(getattr(generator_model, "out_dim", -1)) == int(latent_channels)
+            and current_patch_size == tuple(patch_size)
+        ):
+            return
+        self.generator.reset_patch_io(
+            in_dim=int(latent_channels),
+            out_dim=int(latent_channels),
+            patch_size=patch_size,
+        )
+
+    def _ensure_vae_trainable_modules(self, vae_type: str):
+        if not self._uses_ltx2_vae(vae_type):
+            return
+        patterns = getattr(self.config, "generator_trainable_modules", None)
+        if patterns is None:
+            patterns = getattr(self.config, "trainable_modules", None)
+        if patterns is None:
+            return
+        if isinstance(patterns, str):
+            patterns = [patterns]
+        patterns = [str(pattern) for pattern in patterns if str(pattern)]
+        for pattern in ("patch_embedding", "head.head"):
+            if not any(pattern == existing for existing in patterns):
+                patterns.append(pattern)
+        self.config.generator_trainable_modules = patterns
+
+    def _validate_vae_generator_compatibility(self):
+        latent_channels = getattr(self.vae, "latent_channels", None)
+        if latent_channels is None:
+            return
+        self._validate_generator_latent_channels(latent_channels)
+
+    def _validate_generator_latent_channels(self, latent_channels):
+        if latent_channels is None:
+            return
+        generator_model = self.generator.model0 if getattr(self.generator, "dual_exp", False) else self.generator.model
+        in_dim = getattr(generator_model, "in_dim", None)
+        out_dim = getattr(generator_model, "out_dim", None)
+        mismatches = []
+        if in_dim is not None and int(in_dim) != int(latent_channels):
+            mismatches.append(f"generator.in_dim={in_dim}")
+        if out_dim is not None and int(out_dim) != int(latent_channels):
+            mismatches.append(f"generator.out_dim={out_dim}")
+        if mismatches:
+            raise ValueError(
+                f"VAE latent_channels={latent_channels} is incompatible with "
+                + ", ".join(mismatches)
+                + ". Use a DiT checkpoint/config with matching latent channels before training or inference."
+            )
+
+    def _generator_patch_size(self):
+        generator_model = self.generator.model0 if getattr(self.generator, "dual_exp", False) else self.generator.model
+        return tuple(int(v) for v in getattr(generator_model, "patch_size", (1, 2, 2)))
+
+    def filter_generator_state_dict_for_current_vae(self, state_dict):
+        if not self._uses_ltx2_vae(self.vae_type):
+            return state_dict, []
+        current_state = self.generator.state_dict()
+        skip_prefixes = set()
+        check_suffixes = ("patch_embedding.weight", "head.head.weight")
+        for key, value in state_dict.items():
+            if not torch.is_tensor(value) or not key.endswith(check_suffixes):
+                continue
+            current_value = current_state.get(key)
+            if current_value is None or tuple(current_value.shape) != tuple(value.shape):
+                skip_prefixes.add(key.rsplit(".", 1)[0] + ".")
+        if not skip_prefixes:
+            return state_dict, []
+        filtered = {}
+        skipped = []
+        for key, value in state_dict.items():
+            if any(key.startswith(prefix) for prefix in skip_prefixes):
+                skipped.append(key)
+            else:
+                filtered[key] = value
+        return filtered, skipped
+
+    def load_generator_state_dict_for_current_vae(self, state_dict, strict=True):
+        filtered, skipped = self.filter_generator_state_dict_for_current_vae(state_dict)
+        load_result = self.generator.load_state_dict(filtered, strict=False if skipped else strict)
+        if skipped:
+            allowed_missing = set(skipped)
+            allowed_suffixes = (
+                "patch_embedding.weight",
+                "patch_embedding.bias",
+                "head.head.weight",
+                "head.head.bias",
+            )
+            missing = [
+                key for key in load_result.missing_keys
+                if key not in allowed_missing and not key.endswith(allowed_suffixes)
+            ]
+            unexpected = list(load_result.unexpected_keys)
+            if missing or unexpected:
+                raise RuntimeError(
+                    "Unexpected checkpoint incompatibility after skipping LTX VAE patch I/O keys: "
+                    f"missing={missing}, unexpected={unexpected}"
+                )
+            print("Skipped incompatible LTX VAE patch I/O checkpoint keys: " + ", ".join(skipped))
+        return load_result
 
     def _set_generator_trainable(self, trainable: bool):
         if getattr(self.generator, "dual_exp", False):
@@ -154,7 +306,8 @@ class RectifiedFlowFineTuneModel(nn.Module):
         if task=='i2v-5B':
             noisy_latent[:, :1] = clean_latent[:, :1]
             mask1, mask2 = masks_like([noise], zero=True)
-            temp_ts = (mask2[0][0][:, 0, ::2, ::2] * timestep[0][0]).flatten()
+            pt, ph, pw = self._generator_patch_size()
+            temp_ts = (mask2[0][0][::pt, 0, ::ph, ::pw] * timestep[0][0]).flatten()
             timestep = temp_ts.unsqueeze(0)
 
         target = self.scheduler.training_target(clean_latent, noise, timestep)
